@@ -1,0 +1,31 @@
+{
+  "name": "bitcoin_node_module",
+  "display_name": "Bitcoin Sources",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "description": "The Bitcoin wallet's sources per network: Kyoto peers, Electrum and Esplora servers, and the local node. Tor per source with one proxy, a route table per role, curated peer lists, and address-free health probes. Fail-closed: a source routed through Tor never falls back to a direct connection.",
+  "author": "Logos Core Team",
+  "main": "bitcoin_node_module_plugin",
+  "dependencies": [],
+  "optional_dependencies": ["bitcoind_module"],
+  "dependency_overrides": {
+    "bitcoind_module": { "file": "contracts/bitcoind_module.lidl" }
+  },
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "BitcoinNodeModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "rust": {
+      "toolchain": "1.96.0",
+      "packages": { "build": [], "runtime": [] }
+    },
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}

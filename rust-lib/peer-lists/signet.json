@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "network": "signet",
+  "version": "0",
+  "date": null,
+  "note": "Not curated yet. The crawler will fill it with signet onion peers that serve compact block filters. For development, add your own signet node, on your network or loopback, with set_own_peers.",
+  "refreshUrl": null,
+  "peers": [],
+  "keyId": null,
+  "signature": null
+}

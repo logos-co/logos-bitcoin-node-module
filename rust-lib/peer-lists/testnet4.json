@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "network": "testnet4",
+  "version": "0",
+  "date": null,
+  "note": "Not curated yet. Testnet4 has almost no peers that serve compact block filters, so this list will point at our own filter-serving testnet4 nodes. Until then add your own node with set_own_peers.",
+  "refreshUrl": null,
+  "peers": [],
+  "keyId": null,
+  "signature": null
+}

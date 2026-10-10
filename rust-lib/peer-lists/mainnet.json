@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "network": "mainnet",
+  "version": "0",
+  "date": null,
+  "note": "Not curated yet. A crawler on our build infrastructure will fill this list with onion peers that serve compact block filters (BIP157), checked over Tor against our own node's filter headers, and sign each release of it. Until then Kyoto has no mainnet peers: add your own node with set_own_peers.",
+  "refreshUrl": null,
+  "peers": [],
+  "keyId": null,
+  "signature": null
+}

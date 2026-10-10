@@ -1,0 +1,18 @@
+module bitcoind_module {
+  version "0.0.0"
+  description "PLACEHOLDER for stage 2's bitcoind_module, taken from the Bitcoin plan until logos-bitcoind-module publishes its own contract: runs Bitcoin Core in-process. bitcoin_node_module calls status() only."
+  category "wallet"
+  depends []
+
+  method configure(network: tstr, config: {tstr: any}) -> result description "Merge `config` into the stored settings for `network`. Keys: dataDir, pruneMiB, dbcacheMiB, maxMempoolMiB, proxy, logCategories; unknown keys are refused."
+  method getConfig(network: tstr) -> {tstr: any} description "Stored settings for `network`, with defaults filled in."
+  method defaultConfig(network: tstr) -> {tstr: any} description "Default settings for `network`."
+  method start(network: tstr) -> result description "Start the node for `network`."
+  method stop() -> result description "Stop the node and wait for it to shut down."
+  method flush() -> result description "Write the UTXO cache ahead of a planned stop."
+  method status() -> {tstr: any} description "{ state, network, version, uptimeSecs, lastError, blocks, headers, verificationProgress, initialSync, peersOut, pruneHeight, filterIndexHeight, tipAgeSecs, sizeOnDisk }, filled by a poller thread, so it never waits on the node."
+  method rpc(name: tstr, paramsJson: tstr) -> tstr description "One call into Core's RPC table, in memory: Core's JSON reply. The wallet core and bitcoin_node_module only, with a method allowlist."
+  method logTail(lines: int) -> tstr description "The last `lines` lines of debug.log."
+
+  event bitcoindStateChanged(payloadJson: tstr) description "Emitted on start and stop, with the shape of status()."
+}

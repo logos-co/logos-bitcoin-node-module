@@ -1,0 +1,45 @@
+[package]
+name = "bitcoin_node"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+# Standalone crate: keeps cargo from adopting a workspace in a parent directory.
+[workspace]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Network: socks5h to Tor, TLS on ring, HTTP/1.1 for Esplora, line JSON-RPC for Electrum.
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+tokio-socks = "0.5"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.10"
+thiserror = "2"
+
+# Provided by logos-module-builder at build time (staged into ../logos-rust-sdk-src).
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+
+[profile.release]
+panic = "unwind"
