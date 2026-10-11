@@ -132,3 +132,12 @@ u64 values cross as decimal strings. Persists `bitcoin_sources.json`, atomically
 cd rust-lib && cargo test --no-default-features
 BITCOIN_TEST_TOR=socks5h://127.0.0.1:9050 cargo test --no-default-features --test live -- --ignored --nocapture
 ```
+
+## Windows
+
+`packages.x86_64-windows.*` cross-build from x86_64-linux; the portable `.lgx` passes
+nix-bundle-lgx's system-DLL gate, and the plugin exports only `qt_plugin_instance` and
+`qt_plugin_query_metadata_v2`. Under logosctl on Windows 10.0.26200 (2026-10-11):
+`init_defaults`, the signed mainnet peer list verified, the route tables, a server of your own on
+the LAN (`tcp://framework.lan:…`) routed directly and probed in 108 ms, a public host in plain
+text refused, and an unload in 96 ms.

@@ -44,5 +44,4 @@ jobs:
     secrets: inherit
     with:
       targets: default
-      # Not measured for this repo yet; the Zcash module's 198 (tonic, rustls, SOCKS) plus room.
-      cold-derivation-budget: 240
+      # Measured 53 derivations to build on a cold cache (2026-10-11): under the default budget.
