@@ -22,13 +22,17 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// server for fee rates, every other source off). `{ ok, applied }`. Backend only.
     fn init_defaults(&self) -> String;
     /// `{ ok, network, configured, walletOpen, proxy, sources: [{ id, kind, url, operator, label, use,
-/// history, tor, lan, hasCredentials, route, suspect }], exposes, withoutTor, crossCheck }`; no credential.
+/// history, tor, lan, hasCredentials, certSha256, route, suspect }], exposes, withoutTor, crossCheck }`; no credential.
     fn get_sources(&self, network: String) -> String;
-    /// Replaces the list (a JSON array of sources); answers as get_sources. Backend only;
-/// refused while a wallet is open on `network`.
+    /// Replaces the list (a JSON array of sources); answers as get_sources. A source's
+/// `certSha256` (TLS servers only) is kept when absent and cleared by null. Plain tcp:// or
+/// http:// to a public host is refused with `invalid parameters: …`. Backend only; refused
+/// while a wallet is open on `network`.
     fn set_sources(&self, network: String, list_json: String) -> String;
-    /// Changes one source: `{ use?, history?, tor? }`. tor: false is refused for an onion
-    /// service. Answers as get_sources. Backend only; refused while a wallet is open.
+    /// Changes one source: `{ use?, history?, tor?, certSha256? }`. tor: false is refused for an
+    /// onion service. certSha256 pins the server's end-entity certificate (64 hex characters,
+    /// colons allowed; ssl:// or https:// only); null or "" clears it. Answers as get_sources.
+    /// Backend only; refused while a wallet is open.
     fn set_source(&self, network: String, source_id: String, changes_json: String) -> String;
     /// The Tor proxy for every source, socks5h://host:port; empty clears it, which leaves
     /// every source routed through Tor without a route. Backend only; refused while a wallet is open.
@@ -36,7 +40,8 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// Whether a wallet is open on `network`, which locks its settings. Backend only.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
     /// `{ ok, network, proxy, chain, history, pending, fees, broadcast, check, peers, crossCheck, unrouted }`,
-/// each role `[{ id, kind, url, operator, route: tor|direct|onion }]`. Backend and wallet core.
+/// each role `[{ id, kind, url, operator, route: tor|direct|onion, credentials?, certSha256?, userAdded? }]`.
+/// Backend and wallet core.
     fn route_table(&self, network: String) -> String;
     /// Marks a source suspect until the backend clears it; `height` decimal, or empty.
     /// Backend and wallet core.
@@ -53,7 +58,9 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// Backend only.
     fn refresh_peer_list(&self, network: String) -> String;
     /// `{ ok, network, overall, pending, sources: [{ id, kind, state, tipHeight, tipHash, rttMs,
-    /// route, checkedAt, error, serverVersion, suspect, ... }] }` from address-free calls only.
+    /// route, checkedAt, error, serverVersion, suspect, certificate?, ... }] }` from address-free
+    /// calls only. A TLS server's `certificate` is `{ certSha256, subject, issuer, notBefore,
+    /// notAfter, trusted }`, also when untrusted, for the app to offer pinning it.
     fn source_health(&self, network: String) -> String;
     /// Probes `source_id` now, or every enabled server when empty, then answers as
     /// source_health plus `answered`, within 15 s.

@@ -44,6 +44,7 @@ pub struct Target {
     /// Set only for routes through Tor.
     pub proxy: Option<String>,
     pub credentials: Option<Credentials>,
+    pub cert_sha256: Option<String>,
 }
 
 /// Work the health thread does for a caller that waits on `done`.
@@ -72,7 +73,7 @@ pub struct Node {
 
 struct Inner {
     store: Store,
-    /// Live health by (network, id), with the url it was measured at.
+    /// Live health by (network, id), with the url and pin it was measured with (`tag`).
     health: HashMap<(BNetwork, String), (String, Health)>,
     sent_health: HashMap<BNetwork, String>,
     sent_routes: HashMap<BNetwork, String>,
@@ -90,6 +91,11 @@ fn parse_net(network: &str) -> Result<BNetwork, String> {
 
 fn not_configured(net: BNetwork) -> String {
     format!("{} is not configured: the wallet backend calls init_defaults first", net.name())
+}
+
+/// What a health result was measured against: a new url or pin makes it stale.
+fn tag(url: &str, pin: Option<&str>) -> String {
+    format!("{url} {}", pin.unwrap_or(""))
 }
 
 fn names(nets: impl IntoIterator<Item = BNetwork>) -> Vec<&'static str> {
@@ -139,20 +145,30 @@ impl Inner {
 
     fn health_of(&self, net: BNetwork, s: &Source) -> Option<&Health> {
         match self.health.get(&(net, s.id.clone())) {
-            Some((url, h)) if *url == s.url => Some(h),
+            Some((t, h)) if *t == tag(&s.url, s.cert_sha256.as_deref()) => Some(h),
             _ => None,
         }
     }
 
     fn forget_stale_health(&mut self, net: BNetwork) {
-        let live: Vec<(String, String)> = self.cfg(net).map(|c| c.sources.iter().map(|s| (s.id.clone(), s.url.clone())).collect()).unwrap_or_default();
-        self.health.retain(|(n, id), (url, _)| *n != net || live.iter().any(|(i, u)| i == id && u == url));
+        let live: Vec<(String, String)> =
+            self.cfg(net).map(|c| c.sources.iter().map(|s| (s.id.clone(), tag(&s.url, s.cert_sha256.as_deref()))).collect()).unwrap_or_default();
+        self.health.retain(|(n, id), (t, _)| *n != net || live.iter().any(|(i, lt)| i == id && lt == t));
     }
 
     fn target(&self, net: BNetwork, cfg: &NetConfig, s: &Source) -> Target {
         let route = Self::route_of(cfg, s);
         let proxy = matches!(route, Route::Tor | Route::Onion).then(|| self.store.proxy().map(String::from)).flatten();
-        Target { network: net, id: s.id.clone(), kind: s.kind, url: s.url.clone(), route, proxy, credentials: s.credentials.clone() }
+        Target {
+            network: net,
+            id: s.id.clone(),
+            kind: s.kind,
+            url: s.url.clone(),
+            route,
+            proxy,
+            credentials: s.credentials.clone(),
+            cert_sha256: s.cert_sha256.clone(),
+        }
     }
 
     /// Every peer Kyoto's route can use; the wallet core picks from these per start.
@@ -204,7 +220,7 @@ impl Inner {
             .map(|s| {
                 json!({"id": s.id, "kind": s.kind, "url": s.url, "operator": s.operator, "label": s.label, "use": s.enabled,
                        "history": s.history, "tor": s.tor, "lan": lan(s), "hasCredentials": s.credentials.is_some(),
-                       "route": route(s), "suspect": cfg.suspects.contains_key(&s.id)})
+                       "certSha256": s.cert_sha256, "route": route(s), "suspect": cfg.suspects.contains_key(&s.id)})
             })
             .collect();
         json!({
@@ -511,7 +527,7 @@ impl Node {
                 }
                 let cfg = store.networks.get_mut(&net).ok_or_else(|| not_configured(net))?;
                 let s = cfg.sources.iter_mut().find(|s| s.id == source_id).ok_or_else(|| format!("unknown source {source_id}"))?;
-                changes.apply(s);
+                changes.apply(s)?;
                 Ok(((), vec![]))
             },
             |inner, ()| reply::ok(inner.sources_value(net)),
@@ -727,12 +743,12 @@ impl Node {
             let mut blocked = Vec::new();
             for s in picked.into_iter().filter(|s| s.kind.is_server()) {
                 match inner.blocked(cfg, s) {
-                    Some(why) => blocked.push((s.id.clone(), s.url.clone(), why)),
+                    Some(why) => blocked.push((s.id.clone(), tag(&s.url, s.cert_sha256.as_deref()), why)),
                     None => targets.push(inner.target(net, cfg, s)),
                 }
             }
-            for (id, url, why) in blocked {
-                inner.health.insert((net, id), (url, Health::no_route(why, now())));
+            for (id, t, why) in blocked {
+                inner.health.insert((net, id), (t, Health::no_route(why, now())));
             }
             targets
         };
@@ -814,9 +830,10 @@ impl Node {
     /// Stores a probe result, unless the source changed or went away meanwhile.
     pub fn record(&self, t: &Target, health: Health) {
         let mut inner = self.lock();
-        let current = inner.cfg(t.network).is_some_and(|c| c.sources.iter().any(|s| s.id == t.id && s.url == t.url));
+        let measured = tag(&t.url, t.cert_sha256.as_deref());
+        let current = inner.cfg(t.network).is_some_and(|c| c.sources.iter().any(|s| s.id == t.id && tag(&s.url, s.cert_sha256.as_deref()) == measured));
         if current {
-            inner.health.insert((t.network, t.id.clone()), (t.url.clone(), health));
+            inner.health.insert((t.network, t.id.clone()), (measured, health));
         }
     }
 

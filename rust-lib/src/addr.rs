@@ -4,6 +4,7 @@
 use std::net::{IpAddr, Ipv6Addr};
 
 use crate::net::client::{is_lan_host, is_onion};
+use crate::reply::INVALID;
 
 /// `scheme://[user[:password]@]host[:port][/path]`, host lowercase and without brackets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +146,7 @@ pub fn electrum(url: &str) -> Result<String, String> {
     match p.scheme.as_str() {
         "ssl" => Ok(format!("ssl://{host}:{}", p.port.unwrap_or(ELECTRUM_TLS_PORT))),
         "tcp" if is_onion(&p.host) || is_lan_host(&p.host) => Ok(format!("tcp://{host}:{}", p.port.unwrap_or(ELECTRUM_TCP_PORT))),
-        "tcp" => Err(format!("{url}: plain tcp is only for onion services and servers on your network; use ssl://")),
+        "tcp" => Err(format!("{INVALID}{url}: plain tcp is only for onion services and servers on your network; use ssl://")),
         _ => Err(format!("{url}: an Electrum server is ssl://host:port, or tcp://host:port")),
     }
 }
@@ -164,7 +165,7 @@ pub fn esplora(url: &str) -> Result<(String, Option<(String, String)>), String> 
     let default_port = match p.scheme.as_str() {
         "https" => 443,
         "http" if is_onion(&p.host) || is_lan_host(&p.host) => 80,
-        "http" => return Err(format!("{url}: plain http is only for onion services and servers on your network; use https://")),
+        "http" => return Err(format!("{INVALID}{url}: plain http is only for onion services and servers on your network; use https://")),
         _ => return Err(format!("{url}: an Esplora server is https://host[:port][/path]")),
     };
     let port = match p.port {

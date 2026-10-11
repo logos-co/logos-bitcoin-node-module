@@ -3,6 +3,8 @@
 use serde_json::Value;
 
 pub const NOT_AUTHORIZED: &str = r#"{"ok":false,"error":"not authorized"}"#;
+/// In front of a refusal of what the caller sent, as the wallet core's errors are.
+pub const INVALID: &str = "invalid parameters: ";
 
 /// `{"ok":true}` followed by the fields of `fields`, which must be an object.
 pub fn ok(fields: Value) -> String {

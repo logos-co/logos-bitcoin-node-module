@@ -28,7 +28,7 @@ fn every_default_server_answers() {
     for net in [BNetwork::Mainnet, BNetwork::Testnet4, BNetwork::Signet] {
         for s in defaults(net).into_iter().filter(|s| s.kind.is_server()) {
             let route = route_for(&sources::host(&s), s.tor);
-            targets.push(Target { network: net, id: s.id, kind: s.kind, url: s.url, route, proxy: Some(proxy.clone()), credentials: None });
+            targets.push(Target { network: net, id: s.id, kind: s.kind, url: s.url, route, proxy: Some(proxy.clone()), credentials: None, cert_sha256: None });
         }
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

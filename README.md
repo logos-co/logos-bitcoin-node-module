@@ -10,8 +10,8 @@ directory holds `regtest.json` (any JSON object; test harnesses only).
 
 ## Sources
 
-Each source is `{ id, kind, url, operator, label, use, history, tor }`; `lan` and the route
-are computed. Kinds:
+Each source is `{ id, kind, url, operator, label, use, history, tor, certSha256? }`; `lan` and
+the route are computed. Kinds:
 
 | Kind | url | Fills |
 |---|---|---|
@@ -34,6 +34,14 @@ are computed. Kinds:
 - An Esplora server may take HTTP basic auth (`https://user:pw@host/api`, or `credentials`).
   No read returns it; `get_sources` says `hasCredentials`, and only the wallet core reads it,
   with `source_credentials`. A list sent back without credentials keeps the stored ones.
+- Plain `tcp://` or `http://` is only for an onion service or a server on your network, as in
+  the wallet core; for a public host it is refused with `invalid parameters: …`.
+- `certSha256` pins a TLS server's certificate (`ssl://` or `https://`): the SHA-256 of its
+  end-entity certificate's DER, as the wallet core computes it, stored as 64 lowercase hex
+  characters (colons accepted). It replaces the CAs and the name check; the handshake signature
+  is still checked against that certificate's key. Set or cleared (null) with `set_source` or
+  in `set_sources`, where an entry without it keeps the stored pin. The wallet core uses it
+  for `ssl://` Electrum servers.
 
 ## Defaults
 
@@ -73,7 +81,9 @@ blockstream.info and mempool.space, and Blockstream's own Electrum `server.featu
 
 Plus `proxy`, `peers` (every peer Kyoto's route can use), `crossCheck` (two operators among
 chain and check) and `unrouted` (enabled sources left out, and why: no proxy, suspect, wrong
-network). A disabled source is never routed.
+network). A disabled source is never routed. Entries carry `certSha256` when the source has a
+pin, and `userAdded` for a server the person added: the wallet core speaks plain text only to
+such a server on the person's network.
 
 ## Kyoto's peers
 
@@ -101,7 +111,10 @@ The health thread probes every enabled server once a minute, four at a time, on 
 circuit per server: Electrum `server.version`, `server.features` (the genesis block) and
 `blockchain.headers.subscribe`; Esplora `/blocks/tip/height`, `/blocks/tip/hash`, and
 `/block-height/0` once per circuit. A server on another network is never routed. `probe`
-asks now and answers within 15 s. Kyoto and the local node are not probed here: Kyoto reports
+asks now and answers within 15 s. A TLS server's row carries `certificate`: `{ certSha256,
+subject, issuer, notBefore, notAfter, trusted }`, read in a handshake that proves the server
+holds the key. An untrusted one (a self-signed server, or a pin that no longer matches) is
+still shown, so the app can ask "Trust this certificate?" and pin it with `set_source`. Kyoto and the local node are not probed here: Kyoto reports
 its peers today, and `local_node` asks bitcoind_module (logos-bitcoind-module) for its
 `status()`: an optional dependency, so without it `local_node` answers that it is not loaded.
 

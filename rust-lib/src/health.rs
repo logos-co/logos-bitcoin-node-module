@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 
+use crate::net::cert::CertInfo;
 use crate::network::BNetwork;
 use crate::strnum::ser_opt;
 
@@ -38,6 +39,10 @@ pub struct Health {
     pub error: Option<String>,
     /// An Electrum server's `server.version` software string.
     pub server_version: Option<String>,
+    /// A TLS server's certificate, once it proved it holds the key: trusted or not, so the app
+    /// can ask whether to pin it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<CertInfo>,
 }
 
 /// What an address-free probe saw. `genesis` is `None` when this probe did not ask.
@@ -72,6 +77,7 @@ impl Health {
             checked_at: Some(now),
             error: wrong.then(|| format!("{WRONG_NETWORK}: its genesis block is not {}'s", net.name())),
             server_version: o.server_version,
+            certificate: None,
         }
     }
 }

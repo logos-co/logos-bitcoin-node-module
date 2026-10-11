@@ -16,7 +16,7 @@ use crate::net::socks::{Isolation, ProxyAddr};
 use crate::net::{electrum, esplora, http};
 use crate::node::{now, Job, Node, Target};
 use crate::peers;
-use crate::sources::Kind;
+use crate::sources::{self, Kind};
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// A cold onion circuit took 27 s for the Zcash module; this leaves room for that.
@@ -207,16 +207,17 @@ pub async fn probe(t: &Target, iso: &Isolation, check_genesis: bool) -> Health {
         Err(e) => return Health::unreachable(e, now()),
     };
     let creds = t.credentials.as_ref().map(|c| (c.username.as_str(), c.password.as_str()));
+    let pin = t.cert_sha256.as_deref().and_then(sources::pin_bytes);
     let attempt = async {
         match t.kind {
-            Kind::Electrum => electrum::probe(&t.url, t.route, proxy.as_ref(), iso).await,
-            Kind::Esplora => esplora::probe(&t.url, creds, t.route, proxy.as_ref(), iso, check_genesis).await,
-            Kind::Kyoto | Kind::Local => Err("not probed by this module".into()),
+            Kind::Electrum => electrum::probe(&t.url, t.route, proxy.as_ref(), iso, pin).await,
+            Kind::Esplora => esplora::probe(&t.url, creds, t.route, proxy.as_ref(), iso, check_genesis, pin).await,
+            Kind::Kyoto | Kind::Local => (Err("not probed by this module".into()), None),
         }
     };
     match tokio::time::timeout(PROBE_TIMEOUT, attempt).await {
-        Ok(Ok(o)) => Health::observed(t.network, o, now()),
-        Ok(Err(e)) => Health::unreachable(e.chars().take(240).collect::<String>(), now()),
+        Ok((Ok(o), certificate)) => Health { certificate, ..Health::observed(t.network, o, now()) },
+        Ok((Err(e), certificate)) => Health { certificate, ..Health::unreachable(e.chars().take(240).collect::<String>(), now()) },
         Err(_) => Health::unreachable("timed out", now()),
     }
 }
@@ -253,6 +254,40 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(1000));
     }
 
+    #[tokio::test]
+    async fn a_pinned_server_is_probed_and_a_wrong_pin_refused() {
+        use crate::net::cert::tests::{V1, V1_KEY, V3, V3_KEY};
+        use crate::net::client::tests::{pin_of, tls_server};
+        let electrum = tls_server(V1, V1_KEY, false).await;
+        let esplora = tls_server(V3, V3_KEY, false).await;
+        for (kind, url, cert) in [
+            (Kind::Electrum, format!("ssl://127.0.0.1:{electrum}"), V1),
+            (Kind::Esplora, format!("https://127.0.0.1:{esplora}/api"), V3),
+        ] {
+            let t = Target {
+                network: crate::network::BNetwork::Mainnet,
+                id: "mine".into(),
+                kind,
+                url,
+                route: crate::net::client::Route::Direct,
+                proxy: None,
+                credentials: None,
+                cert_sha256: Some(hex::encode(pin_of(cert))),
+            };
+            let h = probe(&t, &Isolation::fresh(), true).await;
+            assert_eq!((h.state, h.tip_height), (State::Ok, Some(970_838)), "{kind:?}: {:?}", h.error);
+            assert!(h.certificate.as_ref().is_some_and(|c| c.trusted && c.cert_sha256 == hex::encode(pin_of(cert))));
+            let wrong = probe(&Target { cert_sha256: Some("ab".repeat(32)), ..t.clone() }, &Isolation::fresh(), true).await;
+            assert_eq!(wrong.state, State::Unreachable, "{kind:?}");
+            assert!(wrong.error.as_deref().is_some_and(|e| e.contains("not the pinned one")), "{:?}", wrong.error);
+            assert!(wrong.certificate.is_some_and(|c| !c.trusted && c.cert_sha256 == hex::encode(pin_of(cert))), "offered to pin anew");
+            // Unpinned, the web PKI refuses the self-signed certificate and the probe shows it.
+            let unpinned = probe(&Target { cert_sha256: None, ..t }, &Isolation::fresh(), true).await;
+            let c = unpinned.certificate.expect("shown for Trust this certificate?");
+            assert_eq!((unpinned.state, c.trusted), (State::Unreachable, false));
+        }
+    }
+
     #[test]
     fn bad_proxies_and_unprobed_kinds() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -264,6 +299,7 @@ mod tests {
             route: crate::net::client::Route::Onion,
             proxy: Some("socks5://bad".into()),
             credentials: None,
+            cert_sha256: None,
         };
         let h = rt.block_on(probe(&t, &Isolation::fresh(), false));
         assert_eq!(h.state, State::Unreachable);

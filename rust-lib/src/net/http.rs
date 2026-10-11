@@ -6,6 +6,7 @@ use http_body_util::{BodyExt, Empty, Limited};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 
+use super::cert::CertInfo;
 use super::client::{dial, tls, Route};
 use super::socks::{Isolation, ProxyAddr};
 use crate::addr;
@@ -19,27 +20,37 @@ pub struct Conn {
     host: String,
     base: String,
     auth: Option<String>,
+    /// The certificate an https server proved it holds.
+    pub cert: Option<CertInfo>,
 }
 
 impl Conn {
-    pub async fn open(base_url: &str, auth: Option<(&str, &str)>, route: Route, proxy: Option<&ProxyAddr>, iso: &Isolation) -> Result<Self, String> {
-        let p = addr::split(base_url)?;
+    /// Opens it; https is pinned when `pin` is set. A failure carries the certificate an https
+    /// server proved it holds, for the person to pin.
+    pub async fn open(base_url: &str, auth: Option<(&str, &str)>, route: Route, proxy: Option<&ProxyAddr>, iso: &Isolation, pin: Option<[u8; 32]>) -> Result<Self, (String, Option<CertInfo>)> {
+        let p = addr::split(base_url).map_err(|e| (e, None))?;
         let https = match p.scheme.as_str() {
             "https" => true,
             "http" => false,
-            s => return Err(format!("{s}:// is not http")),
+            s => return Err((format!("{s}:// is not http"), None)),
         };
         let port = p.port.unwrap_or(if https { 443 } else { 80 });
-        let stream = dial(&p.host, port, route, proxy, iso).await.map_err(|e| e.to_string())?;
-        let stream = if https { tls(stream, &p.host, true).await.map_err(|e| e.to_string())? } else { stream };
-        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(|e| format!("http: {e}"))?;
+        let stream = dial(&p.host, port, route, proxy, iso).await.map_err(|e| (e.to_string(), None))?;
+        let (stream, cert) = match https {
+            true => match tls(stream, &p.host, true, pin).await {
+                Ok((s, c)) => (s, Some(c)),
+                Err(f) => return Err((f.error.to_string(), f.cert)),
+            },
+            false => (stream, None),
+        };
+        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(|e| (format!("http: {e}"), cert.clone()))?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
         let host = addr::fmt_host(&p.host);
         let host = if port == if https { 443 } else { 80 } { host } else { format!("{host}:{port}") };
         let auth = auth.map(|(u, pw)| format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{u}:{pw}"))));
-        Ok(Self { sender, host, base: p.path, auth })
+        Ok(Self { sender, host, base: p.path, auth, cert })
     }
 
     /// GETs the base URL's path followed by `path`; a body longer than `limit` is an error.
@@ -73,7 +84,7 @@ impl Conn {
 
 /// One GET of a whole URL, as a peer list update is fetched.
 pub async fn fetch(url: &str, route: Route, proxy: Option<&ProxyAddr>, iso: &Isolation, limit: usize) -> Result<Bytes, String> {
-    let mut c = Conn::open(url, None, route, proxy, iso).await?;
+    let mut c = Conn::open(url, None, route, proxy, iso, None).await.map_err(|(e, _)| e)?;
     let (status, body) = c.get("", limit).await?;
     if status != StatusCode::OK {
         return Err(format!("{url}: HTTP {}", status.as_u16()));
@@ -103,7 +114,7 @@ mod tests {
     #[tokio::test]
     async fn get_sends_a_generic_request() {
         let (url, server) = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n970838").await;
-        let mut c = Conn::open(&url, Some(("me", "pw")), Route::Direct, None, &Isolation::fresh()).await.unwrap();
+        let mut c = Conn::open(&url, Some(("me", "pw")), Route::Direct, None, &Isolation::fresh(), None).await.unwrap();
         assert_eq!(c.get_text("/blocks/tip/height").await.unwrap(), "970838");
         let asked = server.await.unwrap().to_ascii_lowercase();
         assert!(asked.starts_with("get /api/blocks/tip/height http/1.1\r\n"), "{asked}");
@@ -114,10 +125,10 @@ mod tests {
     #[tokio::test]
     async fn errors_and_limits() {
         let (url, _s) = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found").await;
-        let mut c = Conn::open(&url, None, Route::Direct, None, &Isolation::fresh()).await.unwrap();
+        let mut c = Conn::open(&url, None, Route::Direct, None, &Isolation::fresh(), None).await.unwrap();
         assert!(c.get_text("/x").await.unwrap_err().contains("HTTP 404"));
         let (url, _s) = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789").await;
-        let mut c = Conn::open(&url, None, Route::Direct, None, &Isolation::fresh()).await.unwrap();
+        let mut c = Conn::open(&url, None, Route::Direct, None, &Isolation::fresh(), None).await.unwrap();
         assert!(c.get("", 4).await.is_err(), "over the limit");
     }
 }

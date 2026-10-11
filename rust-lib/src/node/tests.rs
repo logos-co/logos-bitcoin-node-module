@@ -371,10 +371,43 @@ fn state_persists() {
     let again = Node::open(Some(path), Arc::new(|_| {}));
     for net in ["mainnet", "testnet4", "signet"] {
         assert_eq!(again.get_sources(net), h.node.get_sources(net));
-        assert_eq!(again.route_table(net), h.node.route_table(net), "{net}: the same daily peers too");
+        assert_eq!(again.route_table(net), h.node.route_table(net), "{net}: the same peers too");
         assert_eq!(again.peer_list(net), h.node.peer_list(net));
     }
     assert_eq!(v(again.source_health("mainnet"))["sources"][1]["suspectHeight"], "970000");
+}
+
+#[test]
+fn certificate_pins_through_the_api() {
+    let h = configured();
+    let (typed, pin) = ("AB:".repeat(31) + "AB", "ab".repeat(32));
+    let row = |v: &Value, id: &str| v["sources"].as_array().unwrap().iter().find(|x| x["id"] == id).cloned().unwrap();
+    let mut list = v(h.node.get_sources("mainnet"))["sources"].clone();
+    list.as_array_mut().unwrap().push(json!({"id": "mine", "kind": "electrum", "url": "ssl://electrum.example:50002", "certSha256": typed}));
+    let s = v(h.node.set_sources("mainnet", &list.to_string()));
+    assert_eq!(row(&s, "mine")["certSha256"], pin);
+    let rt = v(h.node.route_table("mainnet"));
+    let entry = rt["check"].as_array().unwrap().iter().find(|e| e["id"] == "mine").cloned().unwrap();
+    assert_eq!((&entry["certSha256"], &entry["userAdded"]), (&json!(pin), &json!(true)));
+    // A round trip of get_sources keeps it.
+    let back = v(h.node.get_sources("mainnet"))["sources"].clone();
+    assert_eq!(row(&v(h.node.set_sources("mainnet", &back.to_string())), "mine")["certSha256"], pin);
+    // A result measured with another pin no longer stands.
+    poll_all(&h.node, |t| answer(t.network, 970_838));
+    assert_eq!(row(&v(h.node.source_health("mainnet")), "mine")["state"], "ok");
+    assert_eq!(row(&v(h.node.set_source("mainnet", "mine", &format!(r#"{{"certSha256":"{}"}}"#, "cd".repeat(32)))), "mine")["certSha256"], "cd".repeat(32));
+    assert_eq!(row(&v(h.node.source_health("mainnet")), "mine")["state"], "unknown");
+    // Refusals, each led by "invalid parameters: ".
+    let pin_kyoto = h.node.set_source("mainnet", KYOTO_ID, &format!(r#"{{"certSha256":"{pin}"}}"#));
+    assert!(v(pin_kyoto)["error"].as_str().unwrap().starts_with("invalid parameters: kyoto: certSha256 is for"));
+    assert!(v(h.node.set_source("mainnet", "mine", r#"{"certSha256":"xyz"}"#))["error"].as_str().unwrap().starts_with("invalid parameters: mine: certSha256 must be"));
+    let mut plain = back.clone();
+    plain.as_array_mut().unwrap().push(json!({"id": "plain", "kind": "electrum", "url": "tcp://electrum.example:50001"}));
+    assert!(v(h.node.set_sources("mainnet", &plain.to_string()))["error"].as_str().unwrap().starts_with("invalid parameters: plain: "));
+    // Kept across a restart; null clears it.
+    let again = Node::open(Some(h.dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
+    assert_eq!(row(&v(again.get_sources("mainnet")), "mine")["certSha256"], "cd".repeat(32));
+    assert_eq!(row(&v(h.node.set_source("mainnet", "mine", r#"{"certSha256":null}"#)), "mine")["certSha256"], Value::Null);
 }
 
 struct FakeLocal(Value);

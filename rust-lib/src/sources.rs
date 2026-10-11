@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::addr;
 use crate::net::client::{is_onion, Route};
 use crate::network::BNetwork;
+use crate::reply::INVALID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,6 +51,10 @@ pub struct Source {
     /// Esplora's HTTP basic auth. Stored, never read back but by the wallet core.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<Credentials>,
+    /// The SHA-256 of the server's end-entity certificate, 64 lowercase hex characters, pinned
+    /// in place of the CAs and the name check (TLS servers only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_sha256: Option<String>,
 }
 
 pub const KYOTO_ID: &str = "kyoto";
@@ -79,6 +84,44 @@ pub fn normalize_url(kind: Kind, url: &str) -> Result<(String, Option<Credential
 /// A server's host; empty for Kyoto and the local node.
 pub fn host(s: &Source) -> String {
     if s.kind.is_server() { addr::host_of(&s.url) } else { String::new() }
+}
+
+/// A server reached over TLS, the only kind a certificate pin applies to.
+pub fn tls_server(kind: Kind, url: &str) -> bool {
+    (kind == Kind::Electrum && url.starts_with("ssl://")) || (kind == Kind::Esplora && url.starts_with("https://"))
+}
+
+/// A pin as stored: 64 lowercase hex characters. Colons are allowed in, as the wallet core reads it.
+pub fn normalize_pin(text: &str) -> Result<String, String> {
+    let digits: String = text.trim().chars().filter(|c| *c != ':').collect::<String>().to_ascii_lowercase();
+    if digits.len() == 64 && digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(digits)
+    } else {
+        Err(format!("{INVALID}certSha256 must be the certificate's SHA-256: 64 hex characters"))
+    }
+}
+
+pub fn pin_bytes(pin: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(pin, &mut out).ok().map(|_| out)
+}
+
+fn pin_refused(id: &str) -> String {
+    format!("{INVALID}{id}: certSha256 is for a server reached over TLS (ssl:// or https://)")
+}
+
+/// `id: why`, keeping the invalid-parameters prefix in front for the caller to see.
+fn about(id: &str, why: &str) -> String {
+    match why.strip_prefix(INVALID) {
+        Some(rest) => format!("{INVALID}{id}: {rest}"),
+        None => format!("{id}: {why}"),
+    }
+}
+
+/// A server this install's defaults do not carry: the person added it. The wallet core lets
+/// only such a server on the person's network speak plain text.
+pub fn user_added(s: &Source) -> bool {
+    s.kind.is_server() && ![MAINNET, TESTNET4, SIGNET].iter().any(|seeds| seeds.iter().any(|d| d.id == s.id && d.kind == s.kind && d.url == s.url))
 }
 
 fn id_ok(id: &str) -> bool {
@@ -128,6 +171,14 @@ pub fn validate(list: &[Source]) -> Result<(), String> {
         if s.tor && s.kind == Kind::Local {
             return Err(format!("{}: the local node is reached over Logos IPC; its own Tor setting is the node app's", s.id));
         }
+        if let Some(p) = &s.cert_sha256 {
+            if normalize_pin(p).as_deref() != Ok(p.as_str()) {
+                return Err(format!("{}: certSha256 must be stored as 64 lowercase hex characters", s.id));
+            }
+            if !tls_server(s.kind, &s.url) {
+                return Err(pin_refused(&s.id));
+            }
+        }
         if let Some(c) = &s.credentials {
             if s.kind != Kind::Esplora {
                 return Err(format!("{}: only Esplora servers take credentials", s.id));
@@ -151,6 +202,7 @@ pub fn kyoto(on: bool) -> Source {
         history: false,
         tor: true,
         credentials: None,
+        cert_sha256: None,
     }
 }
 
@@ -165,6 +217,7 @@ pub fn local(on: bool) -> Source {
         history: false,
         tor: false,
         credentials: None,
+        cert_sha256: None,
     }
 }
 
@@ -230,6 +283,7 @@ pub fn defaults(net: BNetwork) -> Vec<Source> {
         history: false,
         tor: true,
         credentials: None,
+        cert_sha256: None,
     }));
     out.push(local(false));
     out
@@ -256,6 +310,9 @@ struct SourceInput {
     /// Absent keeps the stored ones; null clears them.
     #[serde(default, deserialize_with = "crate::strnum::double_option")]
     credentials: Option<Option<Credentials>>,
+    /// Absent keeps the stored pin; null or "" clears it.
+    #[serde(default, deserialize_with = "crate::strnum::double_option")]
+    cert_sha256: Option<Option<String>>,
     #[serde(default)]
     #[allow(dead_code)]
     lan: Option<bool>,
@@ -284,7 +341,7 @@ pub fn parse_list(json: &str, current: &[Source]) -> Result<Vec<Source>, String>
             return Err("source list: every entry must be a JSON object".into());
         }
         let s: SourceInput = serde_json::from_value(item).map_err(|e| format!("source list: {e}"))?;
-        let (url, in_url) = normalize_url(s.kind, &s.url).map_err(|e| format!("{}: {e}", s.id))?;
+        let (url, in_url) = normalize_url(s.kind, &s.url).map_err(|e| about(&s.id, &e))?;
         let host = if s.kind.is_server() { addr::host_of(&url) } else { String::new() };
         let credentials = match (in_url, s.credentials) {
             (Some(_), Some(_)) => return Err(format!("{}: credentials given twice, in the url and apart", s.id)),
@@ -292,6 +349,15 @@ pub fn parse_list(json: &str, current: &[Source]) -> Result<Vec<Source>, String>
             (None, Some(None)) => None,
             (None, None) => current.iter().find(|c| c.id == s.id && c.url == url && c.kind == s.kind).and_then(|c| c.credentials.clone()),
         };
+        let cert_sha256 = match s.cert_sha256 {
+            None => current.iter().find(|c| c.id == s.id && c.url == url && c.kind == s.kind).and_then(|c| c.cert_sha256.clone()),
+            Some(None) => None,
+            Some(Some(t)) if t.trim().is_empty() => None,
+            Some(Some(t)) => Some(normalize_pin(&t).map_err(|e| about(&s.id, &e))?),
+        };
+        if cert_sha256.is_some() && !tls_server(s.kind, &url) {
+            return Err(pin_refused(&s.id));
+        }
         let operator = given(s.operator).unwrap_or_else(|| match s.kind {
             Kind::Kyoto => KYOTO_OPERATOR.into(),
             Kind::Local => LOCAL_OPERATOR.into(),
@@ -312,6 +378,7 @@ pub fn parse_list(json: &str, current: &[Source]) -> Result<Vec<Source>, String>
             history: s.history.unwrap_or(false),
             tor: s.tor.unwrap_or(s.kind != Kind::Local),
             credentials,
+            cert_sha256,
         });
     }
     validate(&out)?;
@@ -328,6 +395,9 @@ pub struct Changes {
     pub history: Option<bool>,
     #[serde(default)]
     pub tor: Option<bool>,
+    /// A pin to set; null or "" clears it.
+    #[serde(default, deserialize_with = "crate::strnum::double_option")]
+    pub cert_sha256: Option<Option<String>>,
 }
 
 impl Changes {
@@ -339,7 +409,17 @@ impl Changes {
         serde_json::from_value(v).map_err(|e| format!("changes: {e}"))
     }
 
-    pub fn apply(&self, s: &mut Source) {
+    pub fn apply(&self, s: &mut Source) -> Result<(), String> {
+        if let Some(pin) = &self.cert_sha256 {
+            let pin = match pin.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(t) => Some(normalize_pin(t).map_err(|e| about(&s.id, &e))?),
+                None => None,
+            };
+            if pin.is_some() && !tls_server(s.kind, &s.url) {
+                return Err(pin_refused(&s.id));
+            }
+            s.cert_sha256 = pin;
+        }
         if let Some(v) = self.enabled {
             s.enabled = v;
         }
@@ -349,6 +429,7 @@ impl Changes {
         if let Some(v) = self.tor {
             s.tor = v;
         }
+        Ok(())
     }
 }
 
@@ -364,6 +445,12 @@ pub struct RouteEntry {
     /// The wallet core fetches them with source_credentials.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub credentials: bool,
+    /// The pinned certificate's SHA-256, when the source has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_sha256: Option<String>,
+    /// The person added this server (it is not one of the defaults).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub user_added: bool,
 }
 
 /// The routes per role, each in failover order.
@@ -399,6 +486,8 @@ pub fn roles(list: &[Source], route: impl Fn(&Source) -> Route, usable: impl Fn(
         operator: s.operator.clone(),
         route: route(s),
         credentials: s.credentials.is_some(),
+        cert_sha256: s.cert_sha256.clone(),
+        user_added: user_added(s),
     };
     let pick = |keep: &dyn Fn(&Source) -> bool| -> Vec<RouteEntry> { list.iter().filter(|s| on(s) && keep(s)).map(&entry).collect() };
     let authority = list.iter().any(|s| s.enabled && matches!(s.kind, Kind::Local | Kind::Kyoto));
@@ -603,11 +692,85 @@ mod tests {
     }
 
     #[test]
+    fn certificate_pins() {
+        let typed = "AB:".repeat(31) + "AB";
+        let pin = "ab".repeat(32);
+        assert_eq!(normalize_pin(&typed).unwrap(), pin, "colons and capitals, as fingerprints are shown");
+        for bad in ["ab".repeat(31), "zz".repeat(32), "ab".repeat(33), String::new()] {
+            assert!(normalize_pin(&bad).unwrap_err().starts_with(INVALID), "{bad}");
+        }
+        let one = |extra: &str| format!(r#"[{{"id":"mine","kind":"electrum","url":"ssl://electrum.example:50002"{extra}}}]"#);
+        let parsed = parse_list(&one(&format!(r#","certSha256":"{typed}""#)), &[]).unwrap();
+        assert_eq!(parsed[0].cert_sha256.as_deref(), Some(pin.as_str()));
+        assert_eq!(parse_list(&one(""), &parsed).unwrap()[0].cert_sha256, parsed[0].cert_sha256, "absent keeps it");
+        assert_eq!(parse_list(&one(r#","certSha256":null"#), &parsed).unwrap()[0].cert_sha256, None, "null clears it");
+        let moved = parse_list(r#"[{"id":"mine","kind":"electrum","url":"ssl://other.example:50002"}]"#, &parsed).unwrap();
+        assert_eq!(moved[0].cert_sha256, None, "not carried to another url");
+        let esplora = format!(r#"[{{"id":"e","kind":"esplora","url":"https://esplora.example/api","certSha256":"{pin}"}}]"#);
+        assert_eq!(parse_list(&esplora, &[]).unwrap()[0].cert_sha256.as_deref(), Some(pin.as_str()));
+        for (kind, url) in [("electrum", "tcp://192.168.1.20:50001"), ("esplora", "http://192.168.1.20:3002/api")] {
+            let l = format!(r#"[{{"id":"x","kind":"{kind}","url":"{url}","certSha256":"{pin}"}}]"#);
+            let e = parse_list(&l, &[]).unwrap_err();
+            assert!(e.starts_with("invalid parameters: x: certSha256 is for a server reached over TLS"), "{e}");
+        }
+        assert!(parse_list(&one(r#","certSha256":"12""#), &[]).unwrap_err().starts_with("invalid parameters: mine: certSha256 must be"));
+        // set_source: set, clear, refuse.
+        let mut s = parsed[0].clone();
+        Changes::parse(r#"{"certSha256":null}"#).unwrap().apply(&mut s).unwrap();
+        assert_eq!(s.cert_sha256, None);
+        Changes::parse(&format!(r#"{{"certSha256":"{typed}"}}"#)).unwrap().apply(&mut s).unwrap();
+        assert_eq!(s.cert_sha256.as_deref(), Some(pin.as_str()));
+        Changes::parse(r#"{"certSha256":""}"#).unwrap().apply(&mut s).unwrap();
+        assert_eq!(s.cert_sha256, None, "empty clears too");
+        assert!(Changes::parse(r#"{"certSha256":"12"}"#).unwrap().apply(&mut s).unwrap_err().starts_with("invalid parameters: mine: certSha256 must be"));
+        let mut k = kyoto(true);
+        assert!(Changes::parse(&format!(r#"{{"certSha256":"{pin}"}}"#)).unwrap().apply(&mut k).unwrap_err().starts_with("invalid parameters: kyoto: certSha256 is for"));
+        // What is stored is already normalized.
+        let mut stored = parsed.clone();
+        stored[0].cert_sha256 = Some(typed);
+        assert!(validate(&stored).is_err());
+    }
+
+    #[test]
+    fn plain_text_only_to_onion_services_and_your_network() {
+        let onion = format!("{}.onion", "a2".repeat(28));
+        for (kind, url) in [("electrum", "tcp://electrum.example:50001"), ("esplora", "http://mempool.space/api")] {
+            let e = parse_list(&format!(r#"[{{"id":"x","kind":"{kind}","url":"{url}"}}]"#), &[]).unwrap_err();
+            assert!(e.starts_with("invalid parameters: x: ") && e.contains("plain"), "{e}");
+        }
+        let fine = [
+            ("electrum", "tcp://192.168.1.20:50001".to_string()),
+            ("electrum", format!("tcp://{onion}:50001")),
+            ("esplora", "http://umbrel.local/api".to_string()),
+            ("esplora", format!("http://{onion}/api")),
+        ];
+        for (kind, url) in fine {
+            assert!(parse_list(&format!(r#"[{{"id":"x","kind":"{kind}","url":"{url}"}}]"#), &[]).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn route_entries_carry_the_pin_and_who_added_the_server() {
+        let pin = "ab".repeat(32);
+        let mut list = defaults(BNetwork::Mainnet);
+        list.extend(parse_list(&format!(r#"[{{"id":"mine","kind":"electrum","url":"ssl://electrum.example:50002","certSha256":"{pin}"}}]"#), &[]).unwrap());
+        let r = roles(&list, |_| Route::Tor, |_| true);
+        let mine = r.check.iter().find(|e| e.id == "mine").unwrap();
+        assert_eq!((mine.cert_sha256.as_deref(), mine.user_added), (Some(pin.as_str()), true));
+        let theirs = r.fees.iter().find(|e| e.id == "blockstream.info-onion").unwrap();
+        assert_eq!((theirs.cert_sha256.as_deref(), theirs.user_added), (None, false), "a default");
+        let v = serde_json::to_value(mine).unwrap();
+        assert_eq!((&v["certSha256"], &v["userAdded"]), (&serde_json::json!(pin), &serde_json::json!(true)));
+        let v = serde_json::to_value(theirs).unwrap();
+        assert!(v.get("userAdded").is_none() && v.get("certSha256").is_none(), "left out when unset");
+    }
+
+    #[test]
     fn changes() {
         let mut s = defaults(BNetwork::Mainnet)[2].clone();
-        Changes::parse(r#"{"use":true,"history":true}"#).unwrap().apply(&mut s);
+        Changes::parse(r#"{"use":true,"history":true}"#).unwrap().apply(&mut s).unwrap();
         assert!(s.enabled && s.history && s.tor);
-        Changes::parse(r#"{"tor":false}"#).unwrap().apply(&mut s);
+        Changes::parse(r#"{"tor":false}"#).unwrap().apply(&mut s).unwrap();
         assert!(!s.tor && s.enabled);
         for bad in [r#"{"enabled":true}"#, "[]", r#"{"use":"yes"}"#] {
             assert!(Changes::parse(bad).is_err(), "{bad}");

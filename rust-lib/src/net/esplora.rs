@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use super::cert::CertInfo;
 use super::client::Route;
 use super::http::Conn;
 use super::socks::{Isolation, ProxyAddr};
@@ -16,8 +17,9 @@ fn hash_ok(what: &str, h: &str) -> Result<String, String> {
     }
 }
 
-/// Probes the Esplora base URL `url` on the route given; `check_genesis` also asks for block 0.
-/// The round trip timed is the tip height's, on a connection already open.
+/// Probes the Esplora base URL `url` on the route given, pinned when `pin` is set, with the
+/// certificate an https server proved it holds; `check_genesis` also asks for block 0. The round
+/// trip timed is the tip height's, on a connection already open.
 pub async fn probe(
     url: &str,
     creds: Option<(&str, &str)>,
@@ -25,8 +27,18 @@ pub async fn probe(
     proxy: Option<&ProxyAddr>,
     iso: &Isolation,
     check_genesis: bool,
-) -> Result<Observed, String> {
-    let mut c = Conn::open(url, creds, route, proxy, iso).await?;
+    pin: Option<[u8; 32]>,
+) -> (Result<Observed, String>, Option<CertInfo>) {
+    match Conn::open(url, creds, route, proxy, iso, pin).await {
+        Ok(mut c) => {
+            let cert = c.cert.clone();
+            (ask(&mut c, check_genesis).await, cert)
+        }
+        Err((e, cert)) => (Err(e), cert),
+    }
+}
+
+async fn ask(c: &mut Conn, check_genesis: bool) -> Result<Observed, String> {
     let started = Instant::now();
     let height = c.get_text("/blocks/tip/height").await?;
     let rtt_ms = started.elapsed().as_millis() as u64;
@@ -85,7 +97,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn probes_tip_and_genesis_on_one_connection() {
         let (url, server) = fake_server(BNetwork::Signet.genesis(), "325810").await;
-        let o = probe(&url, None, Route::Direct, None, &Isolation::fresh(), true).await.unwrap();
+        let o = probe(&url, None, Route::Direct, None, &Isolation::fresh(), true, None).await.0.unwrap();
         assert_eq!((o.tip_height, o.tip_hash, o.genesis.as_deref()), (325_810, "ab".repeat(32), Some(BNetwork::Signet.genesis())));
         let asked = server.await.unwrap();
         let paths: Vec<&str> = asked.iter().map(|h| h.split_whitespace().nth(1).unwrap()).collect();
@@ -96,10 +108,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn refuses_answers_that_are_not_heights_or_hashes() {
         let (url, _s) = fake_server("nope", "12a").await;
-        let e = probe(&url, None, Route::Direct, None, &Isolation::fresh(), false).await.unwrap_err();
+        let e = probe(&url, None, Route::Direct, None, &Isolation::fresh(), false, None).await.0.unwrap_err();
         assert!(e.contains("not a height"), "{e}");
         let (url, _s) = fake_server("nope", "12").await;
-        let e = probe(&url, None, Route::Direct, None, &Isolation::fresh(), true).await.unwrap_err();
+        let e = probe(&url, None, Route::Direct, None, &Isolation::fresh(), true, None).await.0.unwrap_err();
         assert!(e.contains("/block-height/0: not a block hash"), "{e}");
     }
 }

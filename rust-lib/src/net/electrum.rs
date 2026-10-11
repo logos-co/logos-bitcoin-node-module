@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+use super::cert::CertInfo;
 use super::client::{dial, tls, Route, Stream};
 use super::socks::{Isolation, ProxyAddr};
 use crate::addr;
@@ -65,14 +66,30 @@ pub fn header_hash(hex_header: &str) -> Result<String, String> {
     Ok(hex::encode(h))
 }
 
-/// Probes `ssl://host:port` or `tcp://host:port` on the route given. The round trip timed is
-/// headers.subscribe's, on a connection already open.
-pub async fn probe(url: &str, route: Route, proxy: Option<&ProxyAddr>, iso: &Isolation) -> Result<Observed, String> {
+/// Probes `ssl://host:port` (pinned when `pin` is set) or `tcp://host:port` on the route given,
+/// with the certificate a TLS server proved it holds. The round trip timed is headers.subscribe's,
+/// on a connection already open.
+pub async fn probe(url: &str, route: Route, proxy: Option<&ProxyAddr>, iso: &Isolation, pin: Option<[u8; 32]>) -> (Result<Observed, String>, Option<CertInfo>) {
+    let mut cert = None;
+    let r = probe_on(url, route, proxy, iso, pin, &mut cert).await;
+    (r, cert)
+}
+
+async fn probe_on(url: &str, route: Route, proxy: Option<&ProxyAddr>, iso: &Isolation, pin: Option<[u8; 32]>, cert: &mut Option<CertInfo>) -> Result<Observed, String> {
     let p = addr::split(url)?;
     let port = p.port.ok_or_else(|| format!("{url}: no port"))?;
     let stream = dial(&p.host, port, route, proxy, iso).await.map_err(|e| e.to_string())?;
     let stream = match p.scheme.as_str() {
-        "ssl" => tls(stream, &p.host, false).await.map_err(|e| e.to_string())?,
+        "ssl" => match tls(stream, &p.host, false, pin).await {
+            Ok((s, c)) => {
+                *cert = Some(c);
+                s
+            }
+            Err(f) => {
+                *cert = f.cert;
+                return Err(f.error.to_string());
+            }
+        },
         "tcp" => stream,
         s => return Err(format!("{s}:// is not an Electrum transport")),
     };
@@ -151,7 +168,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn probes_a_server_without_naming_any_address() {
         let (url, server) = fake_server(Some(BNetwork::Mainnet.genesis()), 970_838).await;
-        let o = probe(&url, Route::Direct, None, &Isolation::fresh()).await.unwrap();
+        let o = probe(&url, Route::Direct, None, &Isolation::fresh(), None).await.0.unwrap();
         assert_eq!((o.tip_height, o.tip_hash.as_str(), o.genesis.as_deref()), (970_838, BNetwork::Mainnet.genesis(), Some(BNetwork::Mainnet.genesis())));
         assert_eq!(o.server_version.as_deref(), Some("fake 1.0"));
         drop(o);
@@ -162,7 +179,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn asks_for_the_genesis_header_when_features_leave_it_out() {
         let (url, server) = fake_server(None, 5).await;
-        let o = probe(&url, Route::Direct, None, &Isolation::fresh()).await.unwrap();
+        let o = probe(&url, Route::Direct, None, &Isolation::fresh(), None).await.0.unwrap();
         assert_eq!(o.genesis.as_deref(), Some(BNetwork::Mainnet.genesis()));
         drop(o);
         assert_eq!(server.await.unwrap().last().unwrap(), "blockchain.block.header [0]");
