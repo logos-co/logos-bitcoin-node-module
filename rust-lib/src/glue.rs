@@ -43,8 +43,8 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     fn report_mismatch(&self, network: String, source_id: String, kind: String, height: String) -> String;
     /// `{ ok, network, sourceId, cleared }`. Backend only.
     fn clear_suspect(&self, network: String, source_id: String) -> String;
-    /// `{ ok, network, list: { format, network, version, date, note, refreshUrl, peers, keyId,
-    /// signature }, source: shipped|fetched, ownPeers, today, route, kyotoTor }`.
+    /// `{ ok, network, list: { format, network, version, created, date, note, refreshUrl, peers,
+    /// keyId, signature }, source: shipped|fetched, ownPeers, usable, route, kyotoTor }`.
     fn peer_list(&self, network: String) -> String;
     /// The user's own Kyoto peers (a JSON array of host[:port]), which replace the list; `[]`
     /// goes back to it. Answers as peer_list. Backend only; refused while a wallet is open.

@@ -56,9 +56,10 @@ impl NetConfig {
         self.sources.iter().find(|s| s.kind == Kind::Kyoto).is_none_or(|s| s.tor)
     }
 
-    /// The list Kyoto picks from: a fetched one, or this build's.
+    /// The list Kyoto picks from: a fetched one while it is newer than this build's.
     pub fn peer_list(&self, net: BNetwork) -> PeerList {
-        self.peer_list.clone().unwrap_or_else(|| peers::shipped(net))
+        let shipped = peers::shipped(net);
+        self.peer_list.clone().filter(|l| l.version > shipped.version).unwrap_or(shipped)
     }
 
     /// Replaces the list, keeping only the suspicions of sources still at the same url.
@@ -97,7 +98,8 @@ pub struct Store {
     /// Absent until set or defaulted; null once cleared, which leaves Tor routes closed.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "double_option")]
     pub proxy: Option<Option<String>>,
-    /// Per install: seeds the daily pick of Kyoto peers.
+    /// Per install. No longer read since the wallet core picks Kyoto's peers; kept so stored
+    /// files, which carry it, still load.
     #[serde(default)]
     pub salt: String,
     #[serde(default)]

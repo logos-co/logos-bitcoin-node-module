@@ -119,7 +119,9 @@ fn the_default_route_table() {
     assert_eq!(ids(&rt, "check"), ["blockstream.info-onion"]);
     assert_eq!((route_of(&rt, "fees", "blockstream.info-onion"), route_of(&rt, "chain", "kyoto")), ("onion".into(), "onion".into()));
     assert_eq!(rt["crossCheck"], true);
-    assert_eq!((&rt["peers"], &rt["unrouted"]), (&json!([]), &json!([])), "mainnet's curated list is empty");
+    let shipped = peers::shipped(BNetwork::Mainnet);
+    assert_eq!(rt["peers"], json!(shipped.peers), "the whole curated list: the wallet core picks its own 8");
+    assert_eq!(rt["unrouted"], json!([]));
     let entry = &rt["fees"][0];
     assert_eq!(entry.as_object().unwrap().keys().cloned().collect::<Vec<_>>(), ["id", "kind", "operator", "route", "url"]);
     for role in ["chain", "history", "pending", "fees", "broadcast", "check"] {
@@ -192,11 +194,14 @@ fn kyoto_routes_with_its_peers() {
     let h = configured();
     let peers = |n: &str| v(h.node.peer_list(n));
     let p = peers("signet");
-    assert_eq!((p["route"].as_str(), &p["source"], &p["list"]["version"], &p["today"]), (Some("onion"), &json!("shipped"), &json!("0"), &json!([])));
-    assert_eq!(v(h.node.source_health("signet"))["sources"][0]["state"], "no_peers");
+    let shipped = peers::shipped(BNetwork::Signet);
+    assert_eq!((p["route"].as_str(), &p["source"], &p["list"]["version"]), (Some("onion"), &json!("shipped"), &json!(shipped.version.to_string())));
+    assert_eq!(p["usable"], json!(shipped.peers));
+    let kh = &v(h.node.source_health("signet"))["sources"][0];
+    assert_eq!((kh["state"].as_str(), kh["peers"].as_str()), (Some("not_probed"), Some(shipped.peers.len().to_string().as_str())));
     // Your node on your network: Kyoto dials it directly, and needs no proxy.
     let p = v(h.node.set_own_peers("signet", r#"["192.168.1.20"]"#));
-    assert_eq!((p["ownPeers"].clone(), p["today"].clone(), p["route"].as_str()), (json!(["192.168.1.20:38333"]), json!(["192.168.1.20:38333"]), Some("direct")));
+    assert_eq!((p["ownPeers"].clone(), p["usable"].clone(), p["route"].as_str()), (json!(["192.168.1.20:38333"]), json!(["192.168.1.20:38333"]), Some("direct")));
     h.node.set_proxy("");
     let rt = v(h.node.route_table("signet"));
     assert_eq!((ids(&rt, "chain"), route_of(&rt, "chain", "kyoto"), rt["peers"].clone()), (vec!["kyoto".to_string()], "direct".into(), json!(["192.168.1.20:38333"])));
@@ -308,7 +313,7 @@ fn health_events_suspects_and_wrong_networks() {
     let ok = |t: &Target| answer(t.network, 970_838);
     poll_all(&h.node, ok);
     let events = h.take();
-    assert!(events.contains(&"health mainnet degraded".to_string()), "{events:?}: Kyoto has no mainnet peers yet");
+    assert!(events.contains(&"health mainnet ok".to_string()), "{events:?}: Kyoto has the curated peers and both servers answer");
     let sh = v(h.node.source_health("mainnet"));
     assert_eq!((&sh["pending"], sh["sources"][1]["tipHeight"].as_str(), sh["sources"][1]["state"].as_str()), (&json!(false), Some("970838"), Some("ok")));
     for key in ["state", "tipHeight", "tipHash", "rttMs", "route", "checkedAt", "error", "suspect"] {
@@ -329,7 +334,7 @@ fn health_events_suspects_and_wrong_networks() {
         assert_eq!(v(bad)["ok"], false);
     }
     assert_eq!(v(h.node.clear_suspect("mainnet", "electrum.blockstream.info"))["cleared"], true);
-    assert_eq!(h.take(), ["routes mainnet", "health mainnet degraded"]);
+    assert_eq!(h.take(), ["routes mainnet", "health mainnet ok"], "cleared, and Kyoto has its peers");
     assert_eq!(v(h.node.clear_suspect("mainnet", "electrum.blockstream.info"))["cleared"], false);
 
     // A server on another network answers but is never routed.
@@ -404,7 +409,7 @@ fn probe_and_refresh_need_the_health_thread() {
     assert_eq!(v(h.node.probe("signet", "nope"))["error"], "unknown source nope");
     // Kyoto and the local node are not dialled by this module: their state answers at once.
     let p = v(h.node.probe("signet", KYOTO_ID));
-    assert_eq!((&p["answered"], p["sources"][0]["state"].as_str()), (&json!(true), Some("no_peers")));
+    assert_eq!((&p["answered"], p["sources"][0]["state"].as_str()), (&json!(true), Some("not_probed")));
 }
 
 /// A blocking fake Tor SOCKS port: records each CONNECT target, then refuses it.
@@ -530,10 +535,14 @@ fn probes_go_through_the_health_thread() {
 
 #[test]
 fn refresh_keeps_a_newer_list_only_when_its_signature_checks() {
+    use crate::peers::tests::{sign_fixture, signed, verify_fixture};
     let srv = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}/peers.json", srv.local_addr().unwrap().port());
-    let newer = PeerList { version: 2, date: Some("2026-10-10".into()), key_id: Some("k".into()), signature: Some("00".into()), refresh_url: Some(url.clone()), ..peers::shipped(BNetwork::Signet) };
-    let body = serde_json::to_string(&newer).unwrap();
+    let base = peers::shipped(BNetwork::Signet).version;
+    // A stored list that names where newer ones are published, and the newer one served there.
+    let stored = sign_fixture(PeerList { refresh_url: Some(url.clone()), ..signed(BNetwork::Signet, base + 1, "stored") });
+    let served = sign_fixture(PeerList { refresh_url: Some(url.clone()), ..signed(BNetwork::Signet, base + 2, "served") });
+    let body = serde_json::to_string(&served).unwrap();
     std::thread::spawn(move || {
         for s in srv.incoming().flatten() {
             let mut s = s;
@@ -542,24 +551,32 @@ fn refresh_keeps_a_newer_list_only_when_its_signature_checks() {
             let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
         }
     });
-    for (verify, kept) in [(peers::verify_stub as Verify, false), ((|_: &PeerList| Ok(())) as Verify, true)] {
+    // The fixture key checks both lists; a build that trusts only the stored one refuses the
+    // served one; this build's own keys drop the fixture-signed stored list when it opens.
+    let only_stored: Verify = |l| if l.note == "stored" { Ok(()) } else { peers::verify(l) };
+    for (verify, case) in [(verify_fixture as Verify, "kept"), (only_stored, "refused"), (peers::verify as Verify, "dropped")] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::store::FILE_NAME);
-        // A stored list that names where newer ones are published.
         let mut store = Store::empty();
         store.proxy = Some(None);
         let mut cfg = NetConfig::seeded(BNetwork::Signet);
-        cfg.peer_list = Some(PeerList { version: 1, refresh_url: Some(url.clone()), ..peers::shipped(BNetwork::Signet) });
+        cfg.peer_list = Some(stored.clone());
         store.networks.insert(BNetwork::Signet, cfg);
         store.save(&path).unwrap();
         let node = Node::open_with(Some(path), Arc::new(|_| {}), verify);
         let poller = crate::poll::Poller::start(node.clone()).unwrap();
         let r = v(node.refresh_peer_list("signet"));
-        if kept {
-            assert_eq!((&r["updated"], &r["list"]["version"], &r["source"]), (&json!(true), &json!("2"), &json!("fetched")), "{r}");
-        } else {
-            assert!(r["error"].as_str().unwrap().contains("stub"), "{r}");
-            assert_eq!(v(node.peer_list("signet"))["list"]["version"], "1");
+        let now = v(node.peer_list("signet"));
+        match case {
+            "kept" => assert_eq!((&r["updated"], &r["list"]["version"], &r["source"]), (&json!(true), &json!((base + 2).to_string()), &json!("fetched")), "{r}"),
+            "refused" => {
+                assert!(r["error"].as_str().unwrap().contains("unknown key fixture-1"), "{r}");
+                assert_eq!((&now["list"]["version"], &now["source"]), (&json!((base + 1).to_string()), &json!("fetched")));
+            }
+            _ => {
+                assert!(r["error"].as_str().unwrap().contains("no refresh URL"), "{r}");
+                assert_eq!((&now["list"]["version"], &now["source"]), (&json!(base.to_string()), &json!("shipped")));
+            }
         }
         assert!(poller.stop(Duration::from_millis(1000)));
     }

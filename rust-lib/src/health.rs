@@ -17,7 +17,7 @@ pub enum State {
     WrongNetwork,
     /// Routed through Tor with no proxy set: nothing is dialled.
     NoRoute,
-    /// Kyoto with no peer to dial today.
+    /// Kyoto with no peer to dial.
     NoPeers,
     /// Kyoto and the local node: the wallet core dials them, not this module.
     NotProbed,

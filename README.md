@@ -71,20 +71,29 @@ blockstream.info and mempool.space, and Blockstream's own Electrum `server.featu
 - `broadcast`: the local node, then Kyoto; only when neither is on, the history servers.
 - `check`: every server, asked for tips and headers only.
 
-Plus `proxy`, `peers` (Kyoto's subset today), `crossCheck` (two operators among chain and
-check) and `unrouted` (enabled sources left out, and why: no proxy, suspect, wrong network).
-A disabled source is never routed.
+Plus `proxy`, `peers` (every peer Kyoto's route can use), `crossCheck` (two operators among
+chain and check) and `unrouted` (enabled sources left out, and why: no proxy, suspect, wrong
+network). A disabled source is never routed.
 
 ## Kyoto's peers
 
-The curated list per network is `rust-lib/peer-lists/<network>.json`: format 1, a `version`,
-the day checked, a refresh URL, onion peers as `host:port`, a key id and a signature over the
-list with `signature` null. **The lists are empty**: a crawler on our build infrastructure
-will fill them. Until then add your own node with `set_own_peers`: your peers replace the list.
-Kyoto has one connection type for every peer, so your network's peers and peers through Tor
-don't mix, and an onion peer needs Tor. Each UTC day an install picks a fresh subset of 8.
-`refresh_peer_list` fetches a newer list through the proxy and keeps it only if its signature
-checks: **the check is a stub that refuses every list**, until there is a release key.
+The curated list per network is `rust-lib/peer-lists/<network>.json`, written by the crawler
+(logos-bitcoin-peer-list): format 1, a `version`, when it was signed (`created`), the day of
+its last run (`date`), a refresh URL, onion v3 peers as `host:port`, a key id, and an Ed25519
+signature over `logos-bitcoin-peer-list/1\n` followed by the list as compact JSON in field
+order with `signature` null. A list is used only if its signature checks against a key compiled
+into this build (`rust-lib/keys/`): today that is the crawler's **TEST key**, and the release
+key is not chosen yet. A shipped list that fails is replaced by an empty one that says why.
+
+The shipped mainnet and signet lists are **provisional**: each list's note says how many runs
+it comes from, fewer than the plan's 6 of 7 days. Testnet4 has no list yet; it will point at
+our own nodes. Your own peers (`set_own_peers`) replace the list. Kyoto has one connection type
+for every peer, so your network's peers and peers through Tor don't mix, and an onion peer needs
+Tor. `route_table` lists every usable peer; the wallet core draws 8 at random per start and
+skips a peer that keeps failing. `refresh_peer_list` fetches a newer list through the proxy and
+keeps it only if it is for this network, has a higher version and its signature checks. A kept
+list is checked again whenever the module starts, and is used only while it is newer than the
+one this build ships.
 
 ## Health
 

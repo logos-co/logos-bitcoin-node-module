@@ -1,11 +1,24 @@
 {
   "format": 1,
   "network": "signet",
-  "version": "0",
-  "date": null,
-  "note": "Not curated yet. The crawler will fill it with signet onion peers that serve compact block filters. For development, add your own signet node, on your network or loopback, with set_own_peers.",
+  "version": "202610110405",
+  "created": "2026-10-11T04:05:49Z",
+  "date": "2026-10-11",
+  "note": "PROVISIONAL: from 1 run (2026-10-11), not the plan's 6 of 7 days. Onion v3 peers serving BIP157 filters that passed every check over Tor, checked against our own Core node's filter headers. Signed with a TEST key: not a release.",
   "refreshUrl": null,
-  "peers": [],
-  "keyId": null,
-  "signature": null
+  "peers": [
+    "3qeedpzgciv65tdy2tsdmjxswhyep4aj65jtboznf5nnwcyo2lbmiyqd.onion:38333",
+    "44yjrcnlxcufvpw7jtb7r2fwhc4s6nyw4otjm5qmixwgw62kowh4o5yd.onion:38333",
+    "4jbenbcdlfoiauayz4bdpfueobo3klbjtmdkbnwojq2awhhl74ngbkad.onion:38333",
+    "bxc4ubehjtw4hl7yfz6erdok5z2h76s7f7jlx2amtzxil2fxxcm64byd.onion:38333",
+    "k4d6h4eyeqjn35b3x46f4s3g3eykn4bms52paxuxenkre6nmhfvy6bqd.onion:38333",
+    "kb43gjeddriuhitzvfscgnfezwcw6ozeenbe23d6wp6dwrtqucmxigad.onion:38333",
+    "kklfzzodnlinc3toltn7dlft4vzjf2ckmdw2n3dn4lx3pzw5di2womyd.onion:38333",
+    "n6tf5dfz25i4pprczevdkyo5bkpgfa3xigenn6skpjqqynbxpxzilfid.onion:38333",
+    "rkpn6spq25pgj24vo7hiplnafiev4uyxfh3iapzfqqqj6fpiz6dyfmad.onion:38333",
+    "w7d4rwjt5igozi5v7z2m3in2wm3zsf2lhsizqqohkyrokbbie5equoad.onion:38333",
+    "y263ntblu7ew5a6ujw2kbqma5fv6fk4s34hqc6k2r3elhhkb73bjvjad.onion:38333"
+  ],
+  "keyId": "test-d680f3cac9837bf9",
+  "signature": "2e1f6025ca82432e98acb0cb4004dd848dc27a31792c1035108c52d734db0e4fafefe1d7db1d3034d8a02ab5e77ac3a5478ca8eef0290c752ba0031829890f0c"
 }

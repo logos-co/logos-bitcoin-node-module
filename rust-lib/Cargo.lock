@@ -27,6 +27,7 @@ dependencies = [
  "hyper-util",
  "logos-rust-sdk",
  "rand",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

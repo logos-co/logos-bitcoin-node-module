@@ -57,7 +57,7 @@ pub trait LocalStatus: Send + Sync {
     fn status(&self) -> Result<Value, String>;
 }
 
-/// Checks a fetched peer list's signature; the shipped one is `peers::verify_stub`.
+/// Checks a peer list's signature: `peers::verify`, against the keys compiled in.
 pub type Verify = fn(&PeerList) -> Result<(), String>;
 
 pub struct Node {
@@ -155,9 +155,9 @@ impl Inner {
         Target { network: net, id: s.id.clone(), kind: s.kind, url: s.url.clone(), route, proxy, credentials: s.credentials.clone() }
     }
 
-    /// Kyoto's peers today.
-    fn subset(&self, net: BNetwork, cfg: &NetConfig) -> Vec<String> {
-        peers::subset(&cfg.peer_list(net), &cfg.own_peers, cfg.kyoto_tor(), &self.store.salt, net, peers::today(now()))
+    /// Every peer Kyoto's route can use; the wallet core picks from these per start.
+    fn usable(&self, net: BNetwork, cfg: &NetConfig) -> Vec<String> {
+        peers::usable(&cfg.peer_list(net), &cfg.own_peers, cfg.kyoto_tor())
     }
 
     fn roles(&self, net: BNetwork, cfg: &NetConfig) -> sources::Roles {
@@ -167,7 +167,7 @@ impl Inner {
     fn route_table(&self, net: BNetwork) -> String {
         let Some(cfg) = self.cfg(net) else { return reply::err(not_configured(net)) };
         let r = self.roles(net, cfg);
-        let peers = if r.history.iter().any(|e| e.kind == Kind::Kyoto) { self.subset(net, cfg) } else { vec![] };
+        let peers = if r.history.iter().any(|e| e.kind == Kind::Kyoto) { self.usable(net, cfg) } else { vec![] };
         let unrouted: Vec<Value> = cfg
             .sources
             .iter()
@@ -223,7 +223,7 @@ impl Inner {
         if let Some(why) = self.blocked(cfg, s) {
             return (Health { state: State::NoRoute, error: Some(why.into()), ..Health::default() }, 0);
         }
-        let n = self.subset(net, cfg).len();
+        let n = self.usable(net, cfg).len();
         if n == 0 {
             let why = format!("no peer to dial: {}", cfg.peer_list(net).note);
             return (Health { state: State::NoPeers, error: Some(why), ..Health::default() }, 0);
@@ -294,9 +294,9 @@ impl Inner {
         json!({
             "network": net.name(),
             "list": cfg.peer_list(net),
-            "source": if cfg.peer_list.is_some() { "fetched" } else { "shipped" },
+            "source": if cfg.peer_list.as_ref().is_some_and(|l| l.version > peers::shipped(net).version) { "fetched" } else { "shipped" },
             "ownPeers": cfg.own_peers,
-            "today": self.subset(net, cfg),
+            "usable": self.usable(net, cfg),
             "route": peers::kyoto_route(&cfg.own_peers, tor),
             "kyotoTor": tor,
         })
@@ -335,14 +335,21 @@ fn signature(health: &Value) -> String {
 impl Node {
     /// Loads `path`, or starts unconfigured; `None` keeps everything in memory.
     pub fn open(path: Option<PathBuf>, sink: Sink) -> Arc<Self> {
-        Self::open_with(path, sink, peers::verify_stub)
+        Self::open_with(path, sink, peers::verify)
     }
 
     pub fn open_with(path: Option<PathBuf>, sink: Sink, verify: Verify) -> Arc<Self> {
-        let store = match &path {
+        let mut store = match &path {
             Some(p) => Store::load_or_empty(p),
             None => Store::empty(),
         };
+        // A stored list must still check against this build's keys, which may have changed.
+        for (net, cfg) in store.networks.iter_mut() {
+            if let Some(Err(e)) = cfg.peer_list.as_ref().map(verify) {
+                eprintln!("bitcoin_node_module: dropping the stored {} peer list: {e}", net.name());
+                cfg.peer_list = None;
+            }
+        }
         let mut inner = Inner { store, health: HashMap::new(), sent_health: HashMap::new(), sent_routes: HashMap::new(), wallet_open: BTreeSet::new() };
         for net in networks() {
             let _ = inner.changes(net);
@@ -600,7 +607,7 @@ impl Node {
         )
     }
 
-    /// The curated list with its version and date, the user's own peers, and today's subset.
+    /// The curated list with its version and date, the user's own peers, and the usable peers.
     pub fn peer_list(&self, network: &str) -> String {
         let net = match parse_net(network) {
             Ok(n) => n,
@@ -638,7 +645,7 @@ impl Node {
     }
 
     /// Fetches a newer list from the current list's refresh URL, through the proxy, and keeps
-    /// it only if its signature checks (a stub for now, which refuses every list).
+    /// it only if its signature checks against the keys compiled in.
     pub fn refresh_peer_list(&self, network: &str) -> String {
         let net = match parse_net(network) {
             Ok(n) => n,
