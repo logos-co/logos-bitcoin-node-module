@@ -234,11 +234,13 @@ const fn seed(id: &'static str, kind: Kind, url: &'static str, operator: &'stati
     Seed { id, kind, url, operator, label, on }
 }
 
-/// The onion services in the defaults, as each operator publishes them: blockstream.info's and
-/// mempool.space's Onion-Location headers, and Blockstream's own server.features (2026-10-10).
-pub const VERIFIED_ONIONS: [&str; 2] = [
+/// The onion services in the defaults, from where each is published: blockstream.info's and
+/// mempool.space's Onion-Location headers and Blockstream's own server.features (2026-10-10), and
+/// for testnet4 Electrum's own server list, electrum/chains/testnet4/servers.json (2026-10-11).
+pub const VERIFIED_ONIONS: [&str; 3] = [
     "explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion",
     "mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion",
+    "gsw6sn27quwf6u3swgra6o7lrp5qau6kt3ymuyoxgkth6wntzm2bjwyd.onion",
 ];
 
 // The one enabled server gives fee rates only (history off). The rest stay off until switched on.
@@ -251,9 +253,12 @@ const MAINNET: &[Seed] = &[
     seed("electrum.blockstream.info", Kind::Electrum, "ssl://electrum.blockstream.info:50002", "blockstream.info", "Blockstream Electrum", false),
 ];
 
+// Testnet4 has no working Esplora over Tor (2026-10-11): Electrum servers that answered 3 of 3
+// probes, each on a fresh circuit, with a certificate the web PKI trusts or over an onion service.
 const TESTNET4: &[Seed] = &[
-    seed("mempool.space", Kind::Esplora, "https://mempool.space/testnet4/api", "mempool.space", "mempool.space", true),
-    seed("mempool.space-onion", Kind::Esplora, "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/testnet4/api", "mempool.space", "mempool.space (onion)", false),
+    seed("electrum-testnet4-onion", Kind::Electrum, "tcp://gsw6sn27quwf6u3swgra6o7lrp5qau6kt3ymuyoxgkth6wntzm2bjwyd.onion:52001", "gsw6sn27quwf6u3swgra6o7lrp5qau6kt3ymuyoxgkth6wntzm2bjwyd.onion", "Electrum testnet4 (onion)", true),
+    seed("bitcoin.stagemole.eu", Kind::Electrum, "ssl://bitcoin.stagemole.eu:5010", "stagemole.eu", "stagemole.eu Electrum", false),
+    seed("blackie.c3-soft.com", Kind::Electrum, "ssl://blackie.c3-soft.com:57010", "c3-soft.com", "c3-soft.com Electrum", false),
 ];
 
 const SIGNET: &[Seed] = &[
@@ -573,7 +578,9 @@ mod tests {
             assert!(list.iter().all(|s| !s.history && (s.tor || s.kind == Kind::Local)), "{net:?}");
             let fee: Vec<&&Source> = on.iter().filter(|s| s.kind.is_server()).collect();
             assert_eq!(fee.len(), usize::from(net != BNetwork::Regtest), "{net:?}: one fee server");
-            assert!(fee.iter().all(|s| s.kind == Kind::Esplora));
+            // Testnet4 has no Esplora that answers over Tor; its fee server is an Electrum onion.
+            let kind = if net == BNetwork::Testnet4 { Kind::Electrum } else { Kind::Esplora };
+            assert!(fee.iter().all(|s| s.kind == kind && is_onion(&host(s))), "{net:?}");
             assert_eq!(list.last().unwrap().id, LOCAL_ID);
             assert!(!list.last().unwrap().enabled);
             let r = roles(&list, server_route, all);
@@ -590,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn every_default_onion_is_one_an_operator_published() {
+    fn every_default_onion_is_a_published_one() {
         for net in [BNetwork::Mainnet, BNetwork::Testnet4, BNetwork::Signet] {
             for s in defaults(net).iter().filter(|s| s.kind.is_server()) {
                 let h = host(s);

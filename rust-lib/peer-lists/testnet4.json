@@ -1,12 +1,14 @@
 {
   "format": 1,
   "network": "testnet4",
-  "version": "0",
-  "created": null,
-  "date": null,
-  "note": "No list yet: testnet4 has almost no onion peers that serve compact block filters (the crawler found one on 2026-10-11), so this list will point at our own filter-serving testnet4 nodes. Until then add your own node with set_own_peers.",
+  "version": "202610110832",
+  "created": "2026-10-11T08:32:28Z",
+  "date": "2026-10-11",
+  "note": "PROVISIONAL: the one testnet4 onion peer serving BIP157 filters the crawler found (2026-10-11: version handshake with bits 0, 3 and 6; getcfheaders answered for a stop block from an independent server). No filter-header reference on testnet4. Signed with a TEST key: not a release.",
   "refreshUrl": null,
-  "peers": [],
-  "keyId": null,
-  "signature": null
+  "peers": [
+    "a6yijgwn4vtmmhl7uybtbuyvtl7mtj7arld5f4csqsx4syeii4gt3vqd.onion:48333"
+  ],
+  "keyId": "test-d680f3cac9837bf9",
+  "signature": "0f8d1a2366f836488e3dd2408b9c2ab04f316e193cf3f07e3fddd0e5628c7af2ee38ddd6f2ff287ad4af638f7d16246cd8da3339bf09f82b1c74d446a069a800"
 }

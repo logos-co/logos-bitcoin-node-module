@@ -46,14 +46,14 @@ the route are computed. Kinds:
 ## Defaults
 
 `init_defaults` fills what is absent, field by field: the proxy `socks5h://127.0.0.1:9050`,
-and per network Kyoto on, one Esplora server for fee rates only (history off), and every other
-source off. There are no presets; sources are switched on one by one.
+and per network Kyoto on, one server for fee rates only (history off), and every other source
+off. There are no presets; sources are switched on one by one.
 
 | Network | Fee server (on) | Off, ready to switch on |
 |---|---|---|
 | mainnet | Blockstream Esplora, onion | blockstream.info, both mempool.space addresses, Blockstream Electrum (TLS and onion) |
 | signet | Blockstream Esplora, onion | blockstream.info, both mempool.space addresses |
-| testnet4 | mempool.space | mempool.space's onion |
+| testnet4 | an Electrum onion service (Fulcrum, plain tcp over Tor) | stagemole.eu and c3-soft.com Electrum (TLS) |
 | regtest | none | only your own sources |
 
 Chosen by checking live on 2026-10-10, each request on a fresh Tor circuit. Blockstream's
@@ -61,9 +61,16 @@ onion answered 8 of 8 on mainnet and signet; mempool.space's onion accepted ever
 and closed it unanswered (0 of 8), its clearnet API answered 2 to 5 of 8 through Tor and timed
 out directly from our network, and blockstream.info through Tor was rate-limited once (HTTP
 429). An onion service needs no exit relay, which can be blocked or watch the traffic.
-Blockstream serves no testnet4, so testnet4's only candidate is mempool.space, degraded on that
-day. The onion addresses come from each operator: the `Onion-Location` headers of
-blockstream.info and mempool.space, and Blockstream's own Electrum `server.features`.
+The onion addresses come from each operator: the `Onion-Location` headers of blockstream.info
+and mempool.space, and Blockstream's own Electrum `server.features`.
+
+Testnet4 was checked on 2026-10-11, three probes per server on fresh circuits. No Esplora
+answered over Tor: mempool.space's API and its Electrum on 40002 timed out (0 of 3), its onion
+closed every connection unanswered, and Blockstream serves no testnet4. Of the seven servers in
+Electrum's own testnet4 list (electrum/chains/testnet4/servers.json), three answered 3 of 3 and
+ship: the onion service on its tcp port, and stagemole.eu and c3-soft.com, whose certificates the
+web PKI trusts. The other four answer only with self-signed certificates (two of them version 1);
+pin one with `certSha256` to use it.
 
 ## Routes
 
@@ -96,8 +103,9 @@ into this build (`rust-lib/keys/`): today that is the crawler's **TEST key**, an
 key is not chosen yet. A shipped list that fails is replaced by an empty one that says why.
 
 The shipped mainnet and signet lists are **provisional**: each list's note says how many runs
-it comes from, fewer than the plan's 6 of 7 days. Testnet4 has no list yet; it will point at
-our own nodes. Your own peers (`set_own_peers`) replace the list. Kyoto has one connection type
+it comes from, fewer than the plan's 6 of 7 days. Testnet4's holds the one onion peer the
+crawler found, which answered the handshake and getcfheaders; the plan has it point at our own
+filter-serving nodes, which nobody runs yet. Your own peers (`set_own_peers`) replace the list. Kyoto has one connection type
 for every peer, so your network's peers and peers through Tor don't mix, and an onion peer needs
 Tor. `route_table` lists every usable peer; the wallet core draws 8 at random per start and
 skips a peer that keeps failing. `refresh_peer_list` fetches a newer list through the proxy and

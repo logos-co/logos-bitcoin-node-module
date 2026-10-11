@@ -127,8 +127,8 @@ fn the_default_route_table() {
     for role in ["chain", "history", "pending", "fees", "broadcast", "check"] {
         assert!(rt[role].as_array().unwrap().iter().all(|e| e["id"] != "mempool.space"), "{role}: a disabled source is never routed");
     }
-    assert_eq!(ids(&v(h.node.route_table("testnet4")), "fees"), ["mempool.space", "kyoto"]);
-    assert_eq!(route_of(&v(h.node.route_table("testnet4")), "fees", "mempool.space"), "tor");
+    assert_eq!(ids(&v(h.node.route_table("testnet4")), "fees"), ["electrum-testnet4-onion", "kyoto"]);
+    assert_eq!(route_of(&v(h.node.route_table("testnet4")), "fees", "electrum-testnet4-onion"), "onion");
 }
 
 /// Every combination of tor, lan and onion, with the proxy set and without it.
@@ -375,6 +375,18 @@ fn state_persists() {
         assert_eq!(again.peer_list(net), h.node.peer_list(net));
     }
     assert_eq!(v(again.source_health("mainnet"))["sources"][1]["suspectHeight"], "970000");
+}
+
+#[test]
+fn many_peers_of_your_own() {
+    let h = configured();
+    const B32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let onions: Vec<String> = (0..23).map(|i| format!("{}{}{}.onion:38333", "a2".repeat(27), B32[i / 32] as char, B32[i % 32] as char)).collect();
+    let p = v(h.node.set_own_peers("signet", &serde_json::to_string(&onions).unwrap()));
+    assert_eq!((p["ownPeers"].as_array().map(Vec::len), &p["route"]), (Some(23), &json!("onion")), "{p}");
+    assert_eq!(v(h.node.route_table("signet"))["peers"], json!(onions), "your peers replace the list, all of them");
+    let again = Node::open(Some(h.dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
+    assert_eq!(v(again.peer_list("signet"))["ownPeers"], json!(onions), "kept across a restart");
 }
 
 #[test]

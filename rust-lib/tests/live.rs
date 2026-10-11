@@ -57,6 +57,7 @@ fn every_default_server_answers() {
     for (net, id) in [
         (BNetwork::Mainnet, "blockstream.info-onion"),
         (BNetwork::Signet, "blockstream.info-onion"),
+        (BNetwork::Testnet4, "electrum-testnet4-onion"),
         (BNetwork::Mainnet, "electrum.blockstream.info"),
         (BNetwork::Mainnet, "electrum.blockstream.info-onion"),
     ] {

@@ -12,7 +12,8 @@ use crate::net::client::{is_lan_host, is_onion, Route};
 use crate::network::BNetwork;
 
 pub const FORMAT: u32 = 1;
-pub const MAX_OWN_PEERS: usize = 16;
+/// Distinct peers of your own; a signet node list can reach 20 or more.
+pub const MAX_OWN_PEERS: usize = 64;
 pub const MAX_LIST_PEERS: usize = 1024;
 pub const MAX_LIST_BYTES: usize = 256 * 1024;
 /// In front of the canonical JSON, so a list key's signature means nothing anywhere else.
@@ -202,11 +203,13 @@ pub fn normalize_peer(net: BNetwork, s: &str) -> Result<String, String> {
     Ok(format!("{}:{}", addr::fmt_host(&p.host), p.port.unwrap_or(net.p2p_port())))
 }
 
-/// set_own_peers' argument: a JSON array of `host[:port]`, duplicates dropped.
+/// set_own_peers' argument: a JSON array of `host[:port]`, duplicates dropped, at most
+/// `MAX_OWN_PEERS` distinct ones.
 pub fn parse_own(net: BNetwork, json: &str) -> Result<Vec<String>, String> {
     let items: Vec<String> = serde_json::from_str(json).map_err(|e| format!("peers must be a JSON array of host:port strings: {e}"))?;
-    if items.len() > MAX_OWN_PEERS {
-        return Err(format!("at most {MAX_OWN_PEERS} peers of your own"));
+    let too_many = || format!("at most {MAX_OWN_PEERS} peers of your own");
+    if items.len() > 4 * MAX_OWN_PEERS {
+        return Err(too_many());
     }
     let mut out: Vec<String> = Vec::new();
     for i in items {
@@ -214,6 +217,9 @@ pub fn parse_own(net: BNetwork, json: &str) -> Result<Vec<String>, String> {
         if !out.contains(&p) {
             out.push(p);
         }
+    }
+    if out.len() > MAX_OWN_PEERS {
+        return Err(too_many());
     }
     Ok(out)
 }
@@ -304,7 +310,7 @@ pub(crate) mod tests {
     fn shipped_lists_are_signed_with_the_test_key_or_explained() {
         let test_key = &list_keys()[0].0;
         assert!(test_key.starts_with("test-"), "{test_key}");
-        for net in [BNetwork::Mainnet, BNetwork::Signet] {
+        for net in [BNetwork::Mainnet, BNetwork::Signet, BNetwork::Testnet4] {
             let l = shipped(net);
             l.validate(net).unwrap();
             verify(&l).unwrap();
@@ -312,12 +318,9 @@ pub(crate) mod tests {
             assert!(l.peers.iter().all(|p| is_onion(peer_host(p))), "{net:?}: onion v3 only");
             assert!(l.created.is_some() && l.note.contains("TEST key"), "{net:?}");
         }
-        for net in [BNetwork::Testnet4, BNetwork::Regtest] {
-            let l = shipped(net);
-            l.validate(net).unwrap();
-            assert!(l.peers.is_empty() && l.version == 0 && l.signature.is_none(), "{net:?}");
-            assert!(l.note.contains("set_own_peers"), "{net:?}");
-        }
+        let r = shipped(BNetwork::Regtest);
+        r.validate(BNetwork::Regtest).unwrap();
+        assert!(r.peers.is_empty() && r.version == 0 && r.signature.is_none() && r.note.contains("set_own_peers"));
         // A shipped list whose signature fails is replaced by an empty one that says why.
         let mut bad = shipped(BNetwork::Signet);
         bad.peers.pop();
@@ -346,6 +349,23 @@ pub(crate) mod tests {
         assert_eq!(parse_own(BNetwork::Regtest, r#"["127.0.0.1","127.0.0.1:18444"]"#).unwrap(), ["127.0.0.1:18444"]);
         assert!(parse_own(BNetwork::Mainnet, "\"1.2.3.4\"").is_err());
         assert_eq!(peer_host("[fd00::2]:8333"), "fd00::2");
+    }
+
+    #[test]
+    fn up_to_64_peers_of_your_own() {
+        let ips: Vec<String> = (1..=64).map(|i| format!("10.0.0.{i}")).collect();
+        let mut sent = ips.clone();
+        sent.extend(ips.iter().take(10).cloned());
+        let own = parse_own(BNetwork::Signet, &serde_json::to_string(&sent).unwrap()).unwrap();
+        assert_eq!(own.len(), 64, "duplicates dropped before counting");
+        assert!(own.iter().all(|p| p.ends_with(":38333")));
+        let onions = fake_onions(23);
+        assert_eq!(parse_own(BNetwork::Signet, &serde_json::to_string(&onions).unwrap()).unwrap(), onions, "a privacy test's 23 signet candidates");
+        let mut over = ips;
+        over.push("10.0.1.1".into());
+        assert!(parse_own(BNetwork::Signet, &serde_json::to_string(&over).unwrap()).unwrap_err().contains("at most 64"));
+        assert!(parse_own(BNetwork::Signet, &serde_json::to_string(&vec!["10.0.0.1"; 257]).unwrap()).is_err(), "bounded before parsing each");
+        assert!(parse_own(BNetwork::Signet, r#"["10.0.0.1","seed.example.org"]"#).unwrap_err().contains("outside Tor"), "still validated");
     }
 
     #[test]
