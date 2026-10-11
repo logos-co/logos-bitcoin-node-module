@@ -93,8 +93,8 @@ circuit per server: Electrum `server.version`, `server.features` (the genesis bl
 `blockchain.headers.subscribe`; Esplora `/blocks/tip/height`, `/blocks/tip/hash`, and
 `/block-height/0` once per circuit. A server on another network is never routed. `probe`
 asks now and answers within 15 s. Kyoto and the local node are not probed here: Kyoto reports
-its peers today, and `local_node` asks bitcoind_module, an optional dependency whose contract
-is a placeholder in `contracts/` until logos-bitcoind-module exists.
+its peers today, and `local_node` asks bitcoind_module (logos-bitcoind-module) for its
+`status()`: an optional dependency, so without it `local_node` answers that it is not loaded.
 
 ## Callers
 

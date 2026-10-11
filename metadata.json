@@ -11,9 +11,6 @@
   "main": "bitcoin_node_module_plugin",
   "dependencies": [],
   "optional_dependencies": ["bitcoind_module"],
-  "dependency_overrides": {
-    "bitcoind_module": { "file": "contracts/bitcoind_module.lidl" }
-  },
   "include": [],
   "capabilities": [],
   "codegen": {

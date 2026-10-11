@@ -3,8 +3,11 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    # bitcoind_module (stage 2) has no repository yet: its contract is committed under
-    # contracts/ and named by dependency_overrides in metadata.json.
+    # OPTIONAL in metadata.json: only its contract is consumed.
+    bitcoind_module = {
+      url = "github:logos-co/logos-bitcoind-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

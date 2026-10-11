@@ -1,5 +1,26 @@
 {
   "nodes": {
+    "bitcoind_module": {
+      "inputs": {
+        "logos-bitcoin-core-nix": "logos-bitcoin-core-nix",
+        "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791677515,
+        "narHash": "sha256-x9hg2imiBMTF8ffAPyPiex/sM1hzeRZBb0fEEcFO30w=",
+        "owner": "logos-co",
+        "repo": "logos-bitcoind-module",
+        "rev": "fb767757afaa8f80a9a56c7a9cf083c74ea21caa",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-bitcoind-module",
+        "type": "github"
+      }
+    },
     "default-container": {
       "inputs": {
         "logos-container": "logos-container",
@@ -71,6 +92,33 @@
       "original": {
         "owner": "logos-co",
         "repo": "logos-module-loader-qt",
+        "type": "github"
+      }
+    },
+    "logos-bitcoin-core-nix": {
+      "inputs": {
+        "logos-nix": [
+          "bitcoind_module",
+          "logos-module-builder",
+          "logos-nix"
+        ],
+        "nixpkgs": [
+          "bitcoind_module",
+          "logos-module-builder",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791677303,
+        "narHash": "sha256-moGVmk/p2lrl5/vqh0YpSdw/jZzyWDQ+G/eEKgKuAHQ=",
+        "owner": "logos-co",
+        "repo": "logos-bitcoin-core-nix",
+        "rev": "eb0846bd8458d42b3e11098e906e338f3c48a0e4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-bitcoin-core-nix",
         "type": "github"
       }
     },
@@ -9600,6 +9648,7 @@
     },
     "root": {
       "inputs": {
+        "bitcoind_module": "bitcoind_module",
         "logos-module-builder": "logos-module-builder"
       }
     },
