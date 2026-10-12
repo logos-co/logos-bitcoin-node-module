@@ -109,9 +109,10 @@ Each install keeps its own book per network, `kyoto_peers_<network>.json` in the
 directory (atomic, owner-only): entries `{ addr, port, services, source: list|learned|seed,
 from?, firstSeen, lastSeen, lastOk, okCount, failStreak, skipUntil }`, services and Unix times
 as decimal strings, `lastOk` and `skipUntil` null when unset. The shipped list seeds it as
-`list`; a peer that a newer build's list drops leaves the book. At most 2,000 entries, and 64
-learned from any one `from`. A learned peer that never worked is dropped after 7 days, and any
-learned peer without a success in 30 days.
+`list`; a peer that a newer build's list drops stays as learned (`from: "list"`) if it worked
+here in the last 30 days, and leaves the book otherwise. At most 2,000 entries, and 64 learned
+from any one `from`. A learned peer that never worked is dropped after 7 days, and any learned
+peer without a success in 30 days.
 
 - `report_peers(network, reportJson)`, wallet core only: `{ outcomes: [{ peer, ok, reason? }],
   learned: [{ addr, port, services, seenAt, from }] }`, at most 500 of each. Success sets
@@ -129,11 +130,11 @@ learned peer without a success in 30 days.
 Bitcoin Core 31.1's fixed seeds, onion v3 only, ship as `peer-lists/seeds-<network>.json`
 (`peer-list seeds` from Core's `contrib/seeds`) and enter the book as `seed`; they never go to
 Kyoto. When fewer than 12 usable peers worked in the last 30 days, the health thread asks up to
-8 seeds over Tor (version handshake, `sendaddrv2`, one `getaddr`) and keeps what they gossip
-by the rules above, as learned with `from` the seed: at most once a day per network, and only
-while a wallet is open there, with Kyoto on, no own peers and a proxy. On regtest,
-`regtest.json` may name loopback or LAN seeds, reached directly: `{ "harvestSeeds":
-["127.0.0.1:18444"] }`.
+8 seeds over Tor (version handshake, `sendaddrv2`, one `getaddr`) and keeps what they gossip by
+the rules above, as learned with `from` the seed: a day after a harvest a seed answered, an hour
+after one none answered (at most 3 tries a day), and only while a wallet is open on that
+network, with Kyoto on, no own peers and a proxy. On regtest, `regtest.json` may name loopback
+or LAN seeds, reached directly: `{ "harvestSeeds": ["127.0.0.1:18444"] }`.
 
 ## Health
 
@@ -163,7 +164,7 @@ atomically, owner-only.
 cd rust-lib && cargo test --no-default-features
 BITCOIN_TEST_TOR=socks5h://127.0.0.1:9050 cargo test --no-default-features --test live -- --ignored --nocapture
 # The harvest against a regtest bitcoind it starts itself (31.x), its address book filled first
-BITCOIND=/path/to/bitcoind cargo test --no-default-features --test regtest -- --ignored harvest --nocapture
+BITCOIND=/path/to/bitcoind cargo test --no-default-features --test regtest -- --ignored harvest_against --nocapture
 ```
 
 ## Windows

@@ -1,6 +1,6 @@
 //! Regtest in its own process. The live check needs electrs on loopback (REGTEST_ESPLORA optional):
 //! REGTEST_ELECTRUM=tcp://127.0.0.1:60401 cargo test --no-default-features --test regtest -- --ignored --nocapture
-//! The harvest check starts its own bitcoind (31.x): BITCOIND=/path/to/bitcoind ... -- --ignored harvest
+//! The harvest check starts its own bitcoind (31.x): BITCOIND=/path/to/bitcoind ... -- --ignored harvest_against
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -255,6 +255,24 @@ fn harvest_against_a_regtest_bitcoind() {
         assert!(capable.iter().any(|g| g.host == host) && !plain.contains(&host.to_string()), "{e}");
         assert_eq!((&e["from"], &e["services"], &e["port"]), (&json!(seed), &json!("73"), &json!(18444)));
     }
-    assert!(book["harvestedAt"].is_string() && node.harvest_plan().is_empty(), "once a day");
+    assert!(book["harvestedAt"].is_string() && book["harvestAnswered"] == true && node.harvest_plan().is_empty(), "once a day");
     drop(bitcoind);
+}
+
+/// A seed that does not answer: the harvest stays unanswered, so it is tried again in an hour.
+#[test]
+fn a_harvest_no_seed_answers() {
+    configure();
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(&dir);
+    let closed = format!("127.0.0.1:{}", free_port());
+    node.set_regtest_seeds(std::slice::from_ref(&closed)).unwrap();
+    node.set_wallet_open("regtest", true);
+    let plan = node.harvest_plan();
+    assert_eq!(plan.len(), 1);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    assert_eq!(rt.block_on(bitcoin_node::poll::harvest(node.clone(), plan[0].clone())), 0);
+    let book: Value = serde_json::from_slice(&std::fs::read(dir.path().join("kyoto_peers_regtest.json")).unwrap()).unwrap();
+    assert_eq!((&book["harvestAnswered"], book["harvestTries"].as_array().unwrap().len()), (&json!(false), 1), "{book}");
+    assert!(node.harvest_plan().is_empty(), "not again within the hour");
 }

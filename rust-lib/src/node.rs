@@ -474,8 +474,8 @@ impl Node {
     }
 
     /// Networks with a wallet open whose book holds fewer than 12 usable peers that worked in
-    /// 30 days, Kyoto on and dialling the book: up to 8 seeds each, marked as asked (once a day).
-    /// An onion seed needs the proxy; only regtest's test seeds are dialled directly.
+    /// 30 days, Kyoto on and dialling the book, when a harvest is due (`Book::harvest_due`): up
+    /// to 8 seeds each. An onion seed needs the proxy; only regtest's test seeds go direct.
     pub fn harvest_plan(&self) -> Vec<Harvest> {
         let mut inner = self.lock();
         let now = now();
@@ -505,7 +505,7 @@ impl Node {
                 continue;
             }
             if let Some(b) = inner.books.get_mut(&net) {
-                b.harvested_at = Some(now);
+                b.harvest_started(now);
             }
             inner.save_book(net);
             let proxy = seeds.iter().any(|(_, r)| *r == Route::Onion).then(|| proxy.clone()).flatten();
@@ -514,12 +514,14 @@ impl Node {
         out
     }
 
-    /// What one seed gossiped: onion v3 peers with bits 0, 3 and 6 seen within 3 days, as learned.
+    /// What a seed that answered gossiped: onion v3 peers with bits 0, 3 and 6 seen within 3
+    /// days, as learned. The harvest counts as answered.
     pub fn record_harvest(&self, net: BNetwork, seed: &str, gossip: &[Gossip]) -> book::Learning {
         let (learning, events) = {
             let mut inner = self.lock();
             let now = now();
             let Some(book) = inner.books.get_mut(&net) else { return book::Learning::default() };
+            book.harvest_answered = true;
             let results: Vec<_> = gossip.iter().map(|g| book.harvested(&g.host, g.port, g.services, u64::from(g.time), seed, now)).collect();
             let learning = Book::tally(results);
             book.prune(now);

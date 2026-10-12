@@ -33,6 +33,14 @@ pub fn de_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> 
     }
 }
 
+pub fn ser_vec<S: Serializer>(v: &[u64], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_seq(v.iter().map(u64::to_string))
+}
+
+pub fn de_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u64>, D::Error> {
+    Vec::<String>::deserialize(d)?.iter().map(|t| parse(t).ok_or_else(|| serde::de::Error::custom(format!("not a decimal u64: {t:?}")))).collect()
+}
+
 /// Missing stays `None`, `null` becomes `Some(None)`: "never set" differs from "cleared".
 pub fn double_option<'de, T: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
     Option::<T>::deserialize(d).map(Some)

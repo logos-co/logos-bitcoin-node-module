@@ -456,13 +456,16 @@ fn the_fixed_seeds_are_asked_only_when_the_book_runs_short() {
     assert_eq!(plan.len(), 1);
     assert_eq!((plan[0].network, plan[0].seeds.len(), plan[0].proxy.as_deref()), (BNetwork::Signet, 8, Some(TOR)));
     assert!(plan[0].seeds.iter().all(|(p, r)| *r == Route::Onion && peers::fixed_seeds(BNetwork::Signet).contains(p)));
-    assert!(h.node.harvest_plan().is_empty(), "once a day");
+    assert!(h.node.harvest_plan().is_empty(), "not again within the hour");
+    let book = |h: &Harness| -> Value { serde_json::from_slice(&std::fs::read(h.dir.path().join("kyoto_peers_signet.json")).unwrap()).unwrap() };
+    assert_eq!((&book(&h)["harvestAnswered"], book(&h)["harvestTries"].as_array().unwrap().len()), (&json!(false), 1));
     // What a seed gossiped becomes learned, credited to it.
     let seed = plan[0].seeds[0].0.clone();
     let g = |host: String, services: u64| Gossip { host, port: 38333, services, time: now() as u32 };
     let l = h.node.record_harvest(BNetwork::Signet, &seed, &[g(onion_v3(9), 0x49), g("203.0.113.5".into(), 0x49), g(onion_v3(10), 0x09)]);
     assert_eq!((l.added, l.refused), (1, 2));
-    let book: Value = serde_json::from_slice(&std::fs::read(h.dir.path().join("kyoto_peers_signet.json")).unwrap()).unwrap();
+    let book = book(&h);
+    assert_eq!(book["harvestAnswered"], true, "a seed answered");
     let e = book["entries"].as_array().unwrap().iter().find(|e| e["addr"] == onion_v3(9)).cloned().unwrap();
     assert_eq!((&e["source"], &e["from"]), (&json!("learned"), &json!(seed)));
     assert!(book["harvestedAt"].is_string());

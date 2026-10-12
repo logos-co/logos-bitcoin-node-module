@@ -31,8 +31,13 @@ const NEVER_OK_FOR: u64 = 7 * DAY;
 const OK_WITHIN: u64 = 30 * DAY;
 /// Below this many peers that worked in 30 days, the fixed seeds are asked for more.
 pub const HARVEST_BELOW: usize = 12;
+/// After a harvest a seed answered; after one none answered, an hour, at most 3 tries a day.
 pub const HARVEST_EVERY: u64 = DAY;
+pub const HARVEST_RETRY: u64 = 3600;
+pub const HARVEST_TRIES: usize = 3;
 pub const HARVEST_SEEDS: usize = 8;
+/// `from` of a list peer kept as learned after a newer list dropped it.
+pub const FROM_LIST: &str = "list";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -177,6 +182,12 @@ pub struct Book {
     /// When the fixed seeds were last asked for addresses.
     #[serde(default, serialize_with = "strnum::ser_opt", deserialize_with = "strnum::de_opt")]
     pub harvested_at: Option<u64>,
+    /// Whether a seed answered that harvest.
+    #[serde(default)]
+    pub harvest_answered: bool,
+    /// When the harvests of the last 24 h started.
+    #[serde(default, serialize_with = "strnum::ser_vec", deserialize_with = "strnum::de_vec")]
+    pub harvest_tries: Vec<u64>,
     pub entries: Vec<Entry>,
 }
 
@@ -193,7 +204,7 @@ fn fresh(services: u64, seen_at: u64, now: u64) -> Result<(), &'static str> {
 
 impl Book {
     pub fn new(net: BNetwork) -> Self {
-        Book { format: FORMAT, network: net, list_version: 0, harvested_at: None, entries: vec![] }
+        Book { format: FORMAT, network: net, list_version: 0, harvested_at: None, harvest_answered: false, harvest_tries: vec![], entries: vec![] }
     }
 
     pub fn file_name(net: BNetwork) -> String {
@@ -210,12 +221,20 @@ impl Book {
         self.entries.iter_mut().find(|e| e.addr == host && e.port == port)
     }
 
-    /// Merges the shipped list and the fixed seeds: missing peers added, peers they dropped
-    /// removed, the record of every peer kept. Learned entries stay as they are.
+    /// Merges the shipped list and the fixed seeds: missing peers added, the record of every peer
+    /// kept. A list peer the new list drops stays as learned (`from: "list"`) if it worked here
+    /// in 30 days, and goes otherwise; dropped seeds go. Learned entries stay as they are.
     pub fn sync_shipped(&mut self, list: &[String], list_version: u64, seeds: &[String], now: u64) {
         let split = |p: &String| p.rsplit_once(':').and_then(|(h, port)| Some((h.trim_start_matches('[').trim_end_matches(']').to_string(), port.parse::<u16>().ok()?)));
         let list: HashSet<(String, u16)> = list.iter().filter_map(split).collect();
         let seeds: HashSet<(String, u16)> = seeds.iter().filter_map(split).filter(|k| !list.contains(k)).collect();
+        let since = now.saturating_sub(OK_WITHIN);
+        for e in self.entries.iter_mut().filter(|e| e.source == Origin::List && e.ok_since(since)) {
+            if !list.contains(&(e.addr.clone(), e.port)) {
+                e.source = Origin::Learned;
+                e.from = Some(FROM_LIST.to_string());
+            }
+        }
         self.entries.retain(|e| match e.source {
             Origin::List => list.contains(&(e.addr.clone(), e.port)),
             Origin::Seed => seeds.contains(&(e.addr.clone(), e.port)),
@@ -363,12 +382,26 @@ impl Book {
         }
     }
 
-    /// Fewer than 12 usable peers worked in 30 days, the seeds were not asked in 24 h, and
-    /// there are seeds to ask.
+    /// Fewer than 12 usable peers worked in 30 days and there are seeds to ask: a day after a
+    /// harvest a seed answered, an hour after one none answered, at most 3 tries a day.
     pub fn harvest_due(&self, tor: bool, now: u64) -> bool {
-        self.counts(tor, now).ok_last30d < HARVEST_BELOW
-            && self.entries.iter().any(|e| e.source == Origin::Seed)
-            && self.harvested_at.is_none_or(|t| t.saturating_add(HARVEST_EVERY) <= now)
+        if self.counts(tor, now).ok_last30d >= HARVEST_BELOW || !self.entries.iter().any(|e| e.source == Origin::Seed) {
+            return false;
+        }
+        let Some(last) = self.harvested_at else { return true };
+        if self.harvest_answered {
+            return last.saturating_add(HARVEST_EVERY) <= now;
+        }
+        let today = self.harvest_tries.iter().filter(|&&t| t.saturating_add(DAY) > now).count();
+        last.saturating_add(HARVEST_RETRY) <= now && today < HARVEST_TRIES
+    }
+
+    /// A harvest starting: unanswered until a seed answers (`harvest_answered`).
+    pub fn harvest_started(&mut self, now: u64) {
+        self.harvest_tries.retain(|&t| t.saturating_add(DAY) > now);
+        self.harvest_tries.push(now);
+        self.harvested_at = Some(now);
+        self.harvest_answered = false;
     }
 
     /// Up to 8 seeds, a fresh random pick each time.
@@ -573,12 +606,56 @@ mod tests {
         }
         assert!(!b.harvest_due(true, NOW), "12 peers worked this month");
         assert!(b.harvest_due(true, NOW + 31 * DAY), "a month later they no longer count");
-        b.harvested_at = Some(NOW + 31 * DAY - 3600);
-        assert!(!b.harvest_due(true, NOW + 31 * DAY), "once a day");
+        b.harvest_started(NOW + 31 * DAY - 3600);
+        b.harvest_answered = true;
+        assert!(!b.harvest_due(true, NOW + 31 * DAY), "a seed answered: once a day");
         assert_eq!(b.pick_seeds().len(), 3);
         assert!(!book_with(1, 0).harvest_due(true, NOW), "no seeds to ask");
         let first = b.usable(true, NOW)[0].peer();
         assert!(at(&b, &first).last_ok.is_some(), "peers that worked come first");
+    }
+
+    #[test]
+    fn a_harvest_no_seed_answered_is_tried_again_in_an_hour_three_times_a_day() {
+        const HOUR: u64 = 3600;
+        let mut b = book_with(20, 3);
+        b.harvest_started(NOW);
+        assert!(!b.harvest_due(true, NOW + HOUR - 1), "an hour between tries");
+        assert!(b.harvest_due(true, NOW + HOUR), "no seed answered");
+        b.harvest_started(NOW + HOUR);
+        b.harvest_started(NOW + 2 * HOUR);
+        assert!(!b.harvest_due(true, NOW + 3 * HOUR) && !b.harvest_due(true, NOW + DAY - 1), "3 tries a day");
+        assert!(b.harvest_due(true, NOW + DAY), "the first try is a day old");
+        // A seed answered: the 24 h clock.
+        b.harvest_started(NOW + DAY);
+        b.harvest_answered = true;
+        assert!(!b.harvest_due(true, NOW + DAY + HOUR) && !b.harvest_due(true, NOW + 2 * DAY - 1));
+        assert!(b.harvest_due(true, NOW + 2 * DAY));
+        assert_eq!(b.harvest_tries, [NOW + HOUR, NOW + 2 * HOUR, NOW + DAY], "only the last day's tries");
+        // Kept across a restart.
+        let back: Book = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(back, b);
+    }
+
+    #[test]
+    fn a_list_peer_a_newer_list_drops_stays_learned_if_it_worked_here() {
+        let mut b = book_with(3, 0);
+        b.outcome(&peer(0), true, NOW);
+        b.outcome(&peer(1), true, NOW - 31 * DAY);
+        // Peer 0 worked this month, peer 1 longer ago, peer 2 never.
+        b.sync_shipped(&[peer(9)], 8, &[], NOW);
+        let e = at(&b, &peer(0));
+        assert_eq!((e.source, e.from.as_deref(), e.ok_count), (Origin::Learned, Some(FROM_LIST), 1));
+        assert!(!b.entries.iter().any(|e| e.addr == onion(1) || e.addr == onion(2)));
+        assert_eq!(b.usable(true, NOW).iter().map(|e| e.peer()).collect::<Vec<_>>(), [peer(0), peer(9)]);
+        // A later list naming it again makes it a list peer; otherwise pruning as any learned peer.
+        let mut again = b.clone();
+        again.sync_shipped(&[peer(0), peer(9)], 9, &[], NOW);
+        assert_eq!((at(&again, &peer(0)).source, at(&again, &peer(0)).from.as_deref()), (Origin::List, None));
+        b.prune(NOW + 30 * DAY);
+        assert!(b.entries.iter().any(|e| e.addr == onion(0)));
+        b.prune(NOW + 30 * DAY + 1);
+        assert!(!b.entries.iter().any(|e| e.addr == onion(0)), "30 days without a success");
     }
 
     #[test]
