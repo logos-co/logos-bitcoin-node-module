@@ -15,7 +15,6 @@ pub const FORMAT: u32 = 1;
 /// Distinct peers of your own; a signet node list can reach 20 or more.
 pub const MAX_OWN_PEERS: usize = 64;
 pub const MAX_LIST_PEERS: usize = 1024;
-pub const MAX_LIST_BYTES: usize = 256 * 1024;
 /// In front of the canonical JSON, so a list key's signature means nothing anywhere else.
 pub const DOMAIN: &[u8] = b"logos-bitcoin-peer-list/1\n";
 /// The public half of the TEST key the crawler (logos-bitcoin-peer-list) signs with. The release
@@ -158,22 +157,35 @@ pub fn shipped(net: BNetwork) -> PeerList {
     }
 }
 
-/// A fetched list, kept only if it parses, is for `net`, is newer than `current` and its
-/// signature checks.
-pub fn accept(net: BNetwork, current: &PeerList, body: &[u8], verify: fn(&PeerList) -> Result<(), String>) -> Result<PeerList, String> {
-    if body.len() > MAX_LIST_BYTES {
-        return Err(format!("the fetched peer list is over {MAX_LIST_BYTES} bytes"));
+/// Bitcoin Core's fixed seeds this build ships, onion v3 only (peer-lists/seeds-<network>.json,
+/// written by the crawler's `seeds` command). Regtest has none.
+pub fn fixed_seeds(net: BNetwork) -> &'static [String] {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Seeds {
+        network: BNetwork,
+        peers: Vec<String>,
     }
-    let list: PeerList = serde_json::from_slice(body).map_err(|e| format!("the fetched peer list: {e}"))?;
-    list.validate(net)?;
-    if list.version <= current.version {
-        return Err(format!("the fetched peer list (version {}) is not newer than version {}", list.version, current.version));
+    fn load(net: BNetwork, text: &str) -> Vec<String> {
+        let s: Seeds = serde_json::from_str(text).expect("the shipped seeds parse (see tests)");
+        assert_eq!(s.network, net, "seeds for the wrong network");
+        // Only well-formed onion v3 host:port; a bad line is dropped, not dialled.
+        s.peers.into_iter().filter(|p| normalize_peer(net, p).as_deref() == Ok(p.as_str()) && crate::net::p2p::onion_key(peer_host(p)).is_some()).collect()
     }
-    if list.signature.is_none() || list.key_id.is_none() {
-        return Err("the fetched peer list is not signed".into());
+    static SEEDS: OnceLock<[Vec<String>; 3]> = OnceLock::new();
+    let s = SEEDS.get_or_init(|| {
+        [
+            load(BNetwork::Mainnet, include_str!("../peer-lists/seeds-mainnet.json")),
+            load(BNetwork::Testnet4, include_str!("../peer-lists/seeds-testnet4.json")),
+            load(BNetwork::Signet, include_str!("../peer-lists/seeds-signet.json")),
+        ]
+    });
+    match net {
+        BNetwork::Mainnet => &s[0],
+        BNetwork::Testnet4 => &s[1],
+        BNetwork::Signet => &s[2],
+        BNetwork::Regtest => &[],
     }
-    verify(&list)?;
-    Ok(list)
 }
 
 /// The host of `host:port` (IPv6 without brackets).
@@ -254,15 +266,6 @@ pub fn check_own(own: &[String], tor: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Every peer Kyoto's route can use: your own peers, which replace the list, or the list's peers
-/// that route reaches (onion peers through Tor). The wallet core draws its own 8 per start.
-pub fn usable(list: &PeerList, own: &[String], tor: bool) -> Vec<String> {
-    if !own.is_empty() {
-        return own.to_vec();
-    }
-    list.peers.iter().filter(|p| is_onion(peer_host(p)) == tor).cloned().collect()
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -274,10 +277,6 @@ pub(crate) mod tests {
             let tail: String = (0..4).rev().map(|k| B32[(i >> (5 * k)) & 31] as char).collect();
             format!("{}{tail}.onion:8333", "q".repeat(52))
         }).collect()
-    }
-
-    fn list_of(peers: Vec<String>) -> PeerList {
-        PeerList { peers, ..shipped(BNetwork::Mainnet) }
     }
 
     /// A key for tests only, from a fixed seed: what it signs checks with `verify_fixture`,
@@ -400,84 +399,56 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_whole_usable_list() {
-        let list = list_of(fake_onions(30));
-        list.validate(BNetwork::Mainnet).unwrap();
-        assert_eq!(usable(&list, &[], true), list.peers, "every listed peer: the wallet core picks its own 8");
-        assert!(usable(&list, &[], false).is_empty(), "onion peers need Tor");
-        let own = vec!["192.168.1.20:8333".to_string()];
-        assert_eq!(usable(&list, &own, true), own, "your peers replace the list");
-    }
-
-    #[test]
-    fn a_good_list_is_kept() {
-        let current = shipped(BNetwork::Mainnet);
-        let good = signed(BNetwork::Mainnet, current.version + 1, "good");
-        let body = serde_json::to_vec(&good).unwrap();
-        assert_eq!(accept(BNetwork::Mainnet, &current, &body, verify_fixture).unwrap(), good);
-        // This build's keys do not include the fixture key.
-        assert!(accept(BNetwork::Mainnet, &current, &body, verify).unwrap_err().contains("unknown key fixture-1"));
-    }
-
-    #[test]
-    fn a_bad_signature_is_refused() {
-        let current = shipped(BNetwork::Mainnet);
-        let good = signed(BNetwork::Mainnet, current.version + 1, "good");
-        let check = |l: &PeerList| accept(BNetwork::Mainnet, &current, &serde_json::to_vec(l).unwrap(), verify_fixture);
+    fn a_signed_list_checks_and_any_change_breaks_it() {
+        let good = signed(BNetwork::Mainnet, 3, "good");
+        verify_fixture(&good).unwrap();
+        // This build's own keys do not include the fixture key, so it never ships.
+        assert!(verify(&good).unwrap_err().contains("unknown key fixture-1"));
+        let refused = load_shipped(BNetwork::Mainnet, &serde_json::to_string(&good).unwrap());
+        assert!(refused.peers.is_empty() && refused.note.contains("unknown key"));
         let mut more = good.clone();
         more.peers.push(fake_onions(4)[3].clone());
-        assert!(check(&more).unwrap_err().contains("does not check"), "a peer added after signing");
+        assert!(verify_fixture(&more).unwrap_err().contains("does not check"), "a peer added after signing");
         let mut flipped = good.clone();
         let sig = flipped.signature.take().unwrap();
         flipped.signature = Some(format!("{}{}", if sig.starts_with('0') { "1" } else { "0" }, &sig[1..]));
-        assert!(check(&flipped).unwrap_err().contains("does not check"));
-        let short = PeerList { signature: Some("00".into()), ..good.clone() };
-        assert!(check(&short).unwrap_err().contains("64 bytes"));
-        let unsigned = PeerList { signature: None, ..good.clone() };
-        assert!(check(&unsigned).unwrap_err().contains("not signed"));
+        assert!(verify_fixture(&flipped).unwrap_err().contains("does not check"));
+        assert!(verify_fixture(&PeerList { signature: Some("00".into()), ..good.clone() }).unwrap_err().contains("64 bytes"));
+        assert!(verify_fixture(&PeerList { signature: None, key_id: None, ..good.clone() }).unwrap_err().contains("not signed"));
         // The bare JSON, without the domain tag, is not what a list key signs.
         let mut bare = good.clone();
         bare.signature = Some(hex::encode(fixture().0.sign(&bare.signed_message()[DOMAIN.len()..]).as_ref()));
-        assert!(check(&bare).unwrap_err().contains("does not check"));
+        assert!(verify_fixture(&bare).unwrap_err().contains("does not check"));
     }
 
     #[test]
-    fn the_wrong_network_is_refused() {
-        let current = shipped(BNetwork::Mainnet);
-        let list = signed(BNetwork::Signet, current.version + 1, "signet");
-        let e = accept(BNetwork::Mainnet, &current, &serde_json::to_vec(&list).unwrap(), verify_fixture).unwrap_err();
-        assert!(e.contains("for signet, not mainnet"), "{e}");
-        // Relabelled as mainnet, its signature no longer checks.
-        let relabelled = PeerList { network: BNetwork::Mainnet, ..list };
-        assert!(accept(BNetwork::Mainnet, &current, &serde_json::to_vec(&relabelled).unwrap(), verify_fixture).unwrap_err().contains("does not check"));
+    fn a_list_for_another_network_or_malformed_is_refused() {
+        let signet = shipped(BNetwork::Signet);
+        let as_mainnet = load_shipped(BNetwork::Mainnet, &serde_json::to_string(&signet).unwrap());
+        assert!(as_mainnet.peers.is_empty() && as_mainnet.note.contains("for signet, not mainnet"), "{}", as_mainnet.note);
+        // Relabelled, its signature no longer checks.
+        let relabelled = PeerList { network: BNetwork::Mainnet, ..signet.clone() };
+        assert!(verify(&relabelled).unwrap_err().contains("does not check"));
+        let lan = sign_fixture(PeerList { peers: vec!["192.168.1.20:8333".into()], ..signed(BNetwork::Mainnet, 2, "lan") });
+        assert!(lan.validate(BNetwork::Mainnet).is_err(), "no LAN peer in a curated list");
+        let bad_time = sign_fixture(PeerList { created: Some("2026-10-11 02:00".into()), ..signed(BNetwork::Mainnet, 2, "t") });
+        assert!(bad_time.validate(BNetwork::Mainnet).unwrap_err().contains("created"));
     }
 
     #[test]
-    fn an_old_version_is_refused() {
-        let current = shipped(BNetwork::Mainnet);
-        for version in [current.version, current.version - 1] {
-            let old = signed(BNetwork::Mainnet, version, "old");
-            let e = accept(BNetwork::Mainnet, &current, &serde_json::to_vec(&old).unwrap(), verify_fixture).unwrap_err();
-            assert!(e.contains("not newer"), "{version}: {e}");
+    fn the_fixed_seeds_are_core_onions() {
+        assert!(fixed_seeds(BNetwork::Regtest).is_empty());
+        let files = [
+            (BNetwork::Mainnet, include_str!("../peer-lists/seeds-mainnet.json")),
+            (BNetwork::Testnet4, include_str!("../peer-lists/seeds-testnet4.json")),
+            (BNetwork::Signet, include_str!("../peer-lists/seeds-signet.json")),
+        ];
+        for (net, text) in files {
+            let raw: serde_json::Value = serde_json::from_str(text).unwrap();
+            let seeds = fixed_seeds(net);
+            assert!(!seeds.is_empty() && seeds.len() == raw["peers"].as_array().unwrap().len(), "{net:?}: none dropped");
+            assert!(seeds.iter().all(|p| crate::net::p2p::onion_key(peer_host(p)).is_some() && p.ends_with(&format!(":{}", net.p2p_port()))), "{net:?}");
         }
-        // Nor does a stored list shadow a newer shipped one.
-        let mut cfg = crate::store::NetConfig::seeded(BNetwork::Mainnet);
-        cfg.peer_list = Some(signed(BNetwork::Mainnet, current.version - 1, "stored"));
-        assert_eq!(cfg.peer_list(BNetwork::Mainnet), current);
-        cfg.peer_list = Some(signed(BNetwork::Mainnet, current.version + 1, "stored"));
-        assert_eq!(cfg.peer_list(BNetwork::Mainnet).version, current.version + 1);
-    }
-
-    #[test]
-    fn malformed_lists_are_refused() {
-        let current = shipped(BNetwork::Mainnet);
-        let mut lan = signed(BNetwork::Mainnet, current.version + 1, "lan");
-        lan.peers = vec!["192.168.1.20:8333".into()];
-        let lan = sign_fixture(lan);
-        assert!(accept(BNetwork::Mainnet, &current, &serde_json::to_vec(&lan).unwrap(), verify_fixture).is_err(), "no LAN peer in a curated list");
-        assert!(accept(BNetwork::Mainnet, &current, b"{", verify_fixture).is_err());
-        let bad_time = sign_fixture(PeerList { created: Some("2026-10-11 02:00".into()), ..signed(BNetwork::Mainnet, current.version + 1, "t") });
-        assert!(accept(BNetwork::Mainnet, &current, &serde_json::to_vec(&bad_time).unwrap(), verify_fixture).unwrap_err().contains("created"));
     }
 
     #[test]

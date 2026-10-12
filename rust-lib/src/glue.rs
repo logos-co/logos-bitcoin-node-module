@@ -40,7 +40,8 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// Whether a wallet is open on `network`, which locks its settings. Backend only.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
     /// `{ ok, network, proxy, chain, history, pending, fees, broadcast, check, peers, crossCheck, unrouted }`,
-/// each role `[{ id, kind, url, operator, route: tor|direct|onion, credentials?, certSha256?, userAdded? }]`.
+/// each role `[{ id, kind, url, operator, route: tor|direct|onion, credentials?, certSha256?, userAdded? }]`,
+/// `peers` `[{ peer: "host:port", source: list|learned|own, ok }]` (`ok`: it ever worked).
 /// Backend and wallet core.
     fn route_table(&self, network: String) -> String;
     /// Marks a source suspect until the backend clears it; `height` decimal, or empty.
@@ -49,14 +50,18 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// `{ ok, network, sourceId, cleared }`. Backend only.
     fn clear_suspect(&self, network: String, source_id: String) -> String;
     /// `{ ok, network, list: { format, network, version, created, date, note, refreshUrl, peers,
-    /// keyId, signature }, source: shipped|fetched, ownPeers, usable, route, kyotoTor }`.
+    /// keyId, signature }, ownPeers, usable, counts: { list, learned, seed, usable, okLast30d },
+    /// route, kyotoTor }`; `usable` as route_table's `peers`.
     fn peer_list(&self, network: String) -> String;
     /// The user's own Kyoto peers (a JSON array of host[:port]), which replace the list; `[]`
     /// goes back to it. Answers as peer_list. Backend only; refused while a wallet is open.
     fn set_own_peers(&self, network: String, peers_json: String) -> String;
-    /// Fetches a newer signed list through the proxy and keeps it if its signature checks.
-    /// Backend only.
-    fn refresh_peer_list(&self, network: String) -> String;
+    /// What Kyoto saw: `{ outcomes: [{ peer, ok, reason? }], learned: [{ addr, port, services,
+    /// seenAt, from }] }`, at most 500 of each. An outcome updates the peer's record; the third
+    /// failure in a row skips it for 24 h. A learned peer is kept if it is onion v3 (on regtest,
+    /// on your network), with bits 0, 3 and 6, seen within 3 days. `{ ok, network, outcomes:
+    /// { applied, unknown }, learned: { added, updated, refused }, counts }`. Wallet core only.
+    fn report_peers(&self, network: String, report_json: String) -> String;
     /// `{ ok, network, overall, pending, sources: [{ id, kind, state, tipHeight, tipHash, rttMs,
     /// route, checkedAt, error, serverVersion, suspect, certificate?, ... }] }` from address-free
     /// calls only. A TLS server's `certificate` is `{ certSha256, subject, issuer, notBefore,
@@ -165,8 +170,8 @@ impl BitcoinNodeModule for BitcoinNodeModuleImpl {
         self.gated(Access::Backend, |n| n.set_own_peers(&network, &peers_json))
     }
 
-    fn refresh_peer_list(&self, network: String) -> String {
-        self.gated(Access::Backend, |n| n.refresh_peer_list(&network))
+    fn report_peers(&self, network: String, report_json: String) -> String {
+        self.gated(Access::Core, |n| n.report_peers(&network, &report_json))
     }
 
     fn source_health(&self, network: String) -> String {
@@ -191,10 +196,11 @@ impl BitcoinNodeModule for BitcoinNodeModuleImpl {
         let callers = std::fs::read_to_string(dir.join("callers.json")).ok();
         *self.callers.lock().unwrap() = Callers::from_file(callers.as_deref());
         // A local test chain, for test harnesses only.
-        match std::fs::read_to_string(dir.join("regtest.json")) {
-            Ok(t) if crate::network::regtest_file_ok(&t) => crate::network::configure_regtest(),
-            Ok(_) => eprintln!("bitcoin_node_module: regtest.json is not a JSON object; regtest stays off"),
-            Err(_) => {}
+        let regtest = std::fs::read_to_string(dir.join("regtest.json")).ok();
+        match &regtest {
+            Some(t) if crate::network::regtest_file_ok(t) => crate::network::configure_regtest(),
+            Some(_) => eprintln!("bitcoin_node_module: regtest.json is not a JSON object; regtest stays off"),
+            None => {}
         }
         let sink: Sink = Arc::new(|ev| match ev {
             Event::HealthChanged { network, payload } => emit_source_health_changed(network.name(), &payload),
@@ -203,6 +209,13 @@ impl BitcoinNodeModule for BitcoinNodeModuleImpl {
         });
         let node = Node::open(Some(dir.join(FILE_NAME)), sink);
         node.set_local_status(Arc::new(BitcoindStatus::default()));
+        // Test only: regtest's fixed seeds, reached directly, for the peer harvest.
+        let seeds: Vec<String> = regtest.and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| serde_json::from_value(v["harvestSeeds"].clone()).ok()).unwrap_or_default();
+        if !seeds.is_empty() {
+            if let Err(e) = node.set_regtest_seeds(&seeds) {
+                eprintln!("bitcoin_node_module: regtest.json: {e}");
+            }
+        }
         if self.node.set(node.clone()).is_ok() {
             match Poller::start(node) {
                 Ok(p) => *self.poller.lock().unwrap() = Some(p),

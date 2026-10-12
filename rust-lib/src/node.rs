@@ -1,19 +1,20 @@
 //! The module without the SDK: source lists, the proxy, the route table, Kyoto's peers, health
 //! and events. The glue gates callers and forwards here; replies are flat JSON strings.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
-use crate::addr;
+use crate::book::{self, Book, Report};
 use crate::health::{self, Health, Row, State};
 use crate::net::client::{is_lan_host, route_for, Route};
+use crate::net::p2p::Gossip;
 use crate::network::{bad_network, networks, BNetwork};
-use crate::peers::{self, PeerList};
+use crate::peers::{self, peer_host};
 use crate::proxy::{self, DEFAULT_PROXY};
 use crate::reply;
 use crate::sources::{self, Changes, Credentials, Kind, Source, LOCAL_ID};
@@ -22,7 +23,7 @@ use crate::store::{NetConfig, Store, Suspicion};
 pub const NO_PROXY: &str = "no proxy is set";
 pub const LOCKED: &str = "Close the wallet to change these settings.";
 pub const SUSPECT: &str = "suspect";
-/// How long probe and refresh_peer_list wait on the network, inside the 20 s IPC deadline.
+/// How long probe waits on the network, inside the 20 s IPC deadline.
 pub const CALL_BUDGET: Duration = Duration::from_secs(15);
 
 pub enum Event {
@@ -50,16 +51,21 @@ pub struct Target {
 /// Work the health thread does for a caller that waits on `done`.
 pub enum Job {
     Probe { targets: Vec<Target>, done: mpsc::Sender<()> },
-    Fetch { url: String, route: Route, proxy: Option<String>, done: mpsc::Sender<Result<Vec<u8>, String>> },
+}
+
+/// Fixed seeds the health thread asks for addresses: up to 8 of one network, each once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Harvest {
+    pub network: BNetwork,
+    /// `host:port` and the route to it.
+    pub seeds: Vec<(String, Route)>,
+    pub proxy: Option<String>,
 }
 
 /// bitcoind_module's status, when it is loaded. A trait so the pure tests can stand one in.
 pub trait LocalStatus: Send + Sync {
     fn status(&self) -> Result<Value, String>;
 }
-
-/// Checks a peer list's signature: `peers::verify`, against the keys compiled in.
-pub type Verify = fn(&PeerList) -> Result<(), String>;
 
 pub struct Node {
     inner: Mutex<Inner>,
@@ -68,7 +74,6 @@ pub struct Node {
     wake: Notify,
     local: Mutex<Option<Arc<dyn LocalStatus>>>,
     jobs: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Job>>>,
-    verify: Verify,
 }
 
 struct Inner {
@@ -79,6 +84,11 @@ struct Inner {
     sent_routes: HashMap<BNetwork, String>,
     /// Networks the backend says a wallet is open on: their settings are locked.
     wallet_open: BTreeSet<BNetwork>,
+    /// Kyoto's peer book per network, kept beside the sources file.
+    books: BTreeMap<BNetwork, Book>,
+    dir: Option<PathBuf>,
+    /// Regtest's fixed seeds: a test-only setting from regtest.json.
+    regtest_seeds: Vec<String>,
 }
 
 pub fn now() -> u64 {
@@ -171,9 +181,37 @@ impl Inner {
         }
     }
 
-    /// Every peer Kyoto's route can use; the wallet core picks from these per start.
-    fn usable(&self, net: BNetwork, cfg: &NetConfig) -> Vec<String> {
-        peers::usable(&cfg.peer_list(net), &cfg.own_peers, cfg.kyoto_tor())
+    /// Every peer Kyoto may dial, `{ peer, source, ok }`: your own peers, which replace the book,
+    /// or the book's list and learned peers, skipped ones left out.
+    fn usable(&self, net: BNetwork, cfg: &NetConfig) -> Vec<Value> {
+        if !cfg.own_peers.is_empty() {
+            return cfg.own_peers.iter().map(|p| json!({"peer": p, "source": "own", "ok": false})).collect();
+        }
+        let Some(book) = self.books.get(&net) else { return vec![] };
+        book.usable(cfg.kyoto_tor(), now()).into_iter().map(|e| json!({"peer": e.peer(), "source": e.source, "ok": e.last_ok.is_some()})).collect()
+    }
+
+    fn save_book(&self, net: BNetwork) {
+        if let (Some(dir), Some(b)) = (&self.dir, self.books.get(&net)) {
+            if let Err(e) = b.save(dir) {
+                eprintln!("bitcoin_node_module: saving the {} peer book: {e}", net.name());
+            }
+        }
+    }
+
+    /// The book on disk (or a new one), merged with the shipped list and seeds, pruned.
+    fn load_book(&mut self, net: BNetwork) {
+        let loaded = self.dir.as_deref().map(|d| Book::load(d, net)).unwrap_or_else(|| Book::new(net));
+        let mut b = loaded.clone();
+        let list = peers::shipped(net);
+        let seeds = if net == BNetwork::Regtest { self.regtest_seeds.clone() } else { peers::fixed_seeds(net).to_vec() };
+        b.sync_shipped(&list.peers, list.version, &seeds, now());
+        b.prune(now());
+        let changed = b != loaded;
+        self.books.insert(net, b);
+        if changed {
+            self.save_book(net);
+        }
     }
 
     fn roles(&self, net: BNetwork, cfg: &NetConfig) -> sources::Roles {
@@ -241,7 +279,7 @@ impl Inner {
         }
         let n = self.usable(net, cfg).len();
         if n == 0 {
-            let why = format!("no peer to dial: {}", cfg.peer_list(net).note);
+            let why = format!("no peer to dial: {}", peers::shipped(net).note);
             return (Health { state: State::NoPeers, error: Some(why), ..Health::default() }, 0);
         }
         (Health { state: State::NotProbed, ..Health::default() }, n)
@@ -305,14 +343,20 @@ impl Inner {
         })
     }
 
+    fn counts(&self, net: BNetwork, cfg: &NetConfig) -> book::Counts {
+        let mut c = self.books.get(&net).map(|b| b.counts(cfg.kyoto_tor(), now())).unwrap_or_default();
+        c.usable = self.usable(net, cfg).len();
+        c
+    }
+
     fn peer_list_value(&self, net: BNetwork, cfg: &NetConfig) -> Value {
         let tor = cfg.kyoto_tor();
         json!({
             "network": net.name(),
-            "list": cfg.peer_list(net),
-            "source": if cfg.peer_list.as_ref().is_some_and(|l| l.version > peers::shipped(net).version) { "fetched" } else { "shipped" },
+            "list": peers::shipped(net),
             "ownPeers": cfg.own_peers,
             "usable": self.usable(net, cfg),
+            "counts": self.counts(net, cfg),
             "route": peers::kyoto_route(&cfg.own_peers, tor),
             "kyotoTor": tor,
         })
@@ -350,27 +394,140 @@ fn signature(health: &Value) -> String {
 
 impl Node {
     /// Loads `path`, or starts unconfigured; `None` keeps everything in memory.
+    /// Peer books live beside the sources file, one per network (`kyoto_peers_<network>.json`).
     pub fn open(path: Option<PathBuf>, sink: Sink) -> Arc<Self> {
-        Self::open_with(path, sink, peers::verify)
-    }
-
-    pub fn open_with(path: Option<PathBuf>, sink: Sink, verify: Verify) -> Arc<Self> {
-        let mut store = match &path {
+        let store = match &path {
             Some(p) => Store::load_or_empty(p),
             None => Store::empty(),
         };
-        // A stored list must still check against this build's keys, which may have changed.
-        for (net, cfg) in store.networks.iter_mut() {
-            if let Some(Err(e)) = cfg.peer_list.as_ref().map(verify) {
-                eprintln!("bitcoin_node_module: dropping the stored {} peer list: {e}", net.name());
-                cfg.peer_list = None;
-            }
-        }
-        let mut inner = Inner { store, health: HashMap::new(), sent_health: HashMap::new(), sent_routes: HashMap::new(), wallet_open: BTreeSet::new() };
+        let dir = path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+        let mut inner = Inner {
+            store,
+            health: HashMap::new(),
+            sent_health: HashMap::new(),
+            sent_routes: HashMap::new(),
+            wallet_open: BTreeSet::new(),
+            books: BTreeMap::new(),
+            dir,
+            regtest_seeds: vec![],
+        };
         for net in networks() {
+            inner.load_book(net);
             let _ = inner.changes(net);
         }
-        Arc::new(Self { inner: Mutex::new(inner), path, sink, wake: Notify::new(), local: Mutex::new(None), jobs: Mutex::new(None), verify })
+        Arc::new(Self { inner: Mutex::new(inner), path, sink, wake: Notify::new(), local: Mutex::new(None), jobs: Mutex::new(None) })
+    }
+
+    /// Regtest's fixed seeds, reached directly: a test-only setting (regtest.json's harvestSeeds).
+    pub fn set_regtest_seeds(&self, seeds: &[String]) -> Result<(), String> {
+        for s in seeds {
+            if peers::normalize_peer(BNetwork::Regtest, s).as_deref() != Ok(s.as_str()) || !is_lan_host(peer_host(s)) {
+                return Err(format!("harvestSeeds: {s} is not host:port on your network"));
+            }
+        }
+        if !networks().contains(&BNetwork::Regtest) {
+            return Err("regtest is not configured".into());
+        }
+        let events = {
+            let mut inner = self.lock();
+            inner.regtest_seeds = seeds.to_vec();
+            inner.load_book(BNetwork::Regtest);
+            inner.changes(BNetwork::Regtest)
+        };
+        self.emit(events);
+        Ok(())
+    }
+
+    /// The wallet core's report on Kyoto's peers: outcomes, which update each peer's record and
+    /// skip one for 24 h after 3 failures in a row, and peers learned from gossip.
+    pub fn report_peers(&self, network: &str, report_json: &str) -> String {
+        let net = match parse_net(network) {
+            Ok(n) => n,
+            Err(e) => return reply::err(e),
+        };
+        let report = match Report::parse(report_json) {
+            Ok(r) => r,
+            Err(e) => return reply::err(e),
+        };
+        let (out, events) = {
+            let mut inner = self.lock();
+            let now = now();
+            let Some(book) = inner.books.get_mut(&net) else { return reply::err(format!("no peer book for {}", net.name())) };
+            let (mut applied, mut unknown) = (0, 0);
+            for o in &report.outcomes {
+                if book.outcome(&o.peer, o.ok, now) {
+                    applied += 1;
+                } else {
+                    unknown += 1;
+                }
+            }
+            let results: Vec<_> = report.learned.iter().map(|l| book.learn(l, now)).collect();
+            let learned = Book::tally(results);
+            book.prune(now);
+            inner.save_book(net);
+            let counts = inner.cfg(net).map(|c| inner.counts(net, c)).unwrap_or_default();
+            let out = reply::ok(json!({"network": net.name(), "outcomes": {"applied": applied, "unknown": unknown}, "learned": learned, "counts": counts}));
+            (out, inner.changes(net))
+        };
+        self.emit(events);
+        out
+    }
+
+    /// Networks with a wallet open whose book holds fewer than 12 usable peers that worked in
+    /// 30 days, Kyoto on and dialling the book: up to 8 seeds each, marked as asked (once a day).
+    /// An onion seed needs the proxy; only regtest's test seeds are dialled directly.
+    pub fn harvest_plan(&self) -> Vec<Harvest> {
+        let mut inner = self.lock();
+        let now = now();
+        let proxy = inner.store.proxy().map(String::from);
+        let mut out = Vec::new();
+        for net in networks() {
+            let Some(cfg) = inner.cfg(net) else { continue };
+            let kyoto = cfg.sources.iter().any(|s| s.kind == Kind::Kyoto && s.enabled);
+            if !kyoto || !cfg.own_peers.is_empty() || !inner.wallet_open.contains(&net) {
+                continue;
+            }
+            let tor = cfg.kyoto_tor();
+            let Some(book) = inner.books.get(&net) else { continue };
+            if !book.harvest_due(tor, now) {
+                continue;
+            }
+            let seeds: Vec<(String, Route)> = book
+                .pick_seeds()
+                .into_iter()
+                .filter_map(|p| match route_for(peer_host(&p), true) {
+                    Route::Onion if proxy.is_some() => Some((p, Route::Onion)),
+                    Route::Direct if net == BNetwork::Regtest => Some((p, Route::Direct)),
+                    _ => None,
+                })
+                .collect();
+            if seeds.is_empty() {
+                continue;
+            }
+            if let Some(b) = inner.books.get_mut(&net) {
+                b.harvested_at = Some(now);
+            }
+            inner.save_book(net);
+            let proxy = seeds.iter().any(|(_, r)| *r == Route::Onion).then(|| proxy.clone()).flatten();
+            out.push(Harvest { network: net, seeds, proxy });
+        }
+        out
+    }
+
+    /// What one seed gossiped: onion v3 peers with bits 0, 3 and 6 seen within 3 days, as learned.
+    pub fn record_harvest(&self, net: BNetwork, seed: &str, gossip: &[Gossip]) -> book::Learning {
+        let (learning, events) = {
+            let mut inner = self.lock();
+            let now = now();
+            let Some(book) = inner.books.get_mut(&net) else { return book::Learning::default() };
+            let results: Vec<_> = gossip.iter().map(|g| book.harvested(&g.host, g.port, g.services, u64::from(g.time), seed, now)).collect();
+            let learning = Book::tally(results);
+            book.prune(now);
+            inner.save_book(net);
+            (learning, inner.changes(net))
+        };
+        self.emit(events);
+        learning
     }
 
     /// Notified when sources or the proxy change, so the poller looks at once.
@@ -657,61 +814,6 @@ impl Node {
                 Ok(((), vec![]))
             },
             |inner, ()| inner.cfg(net).map(|c| reply::ok(inner.peer_list_value(net, c))).unwrap_or_else(|| reply::err(not_configured(net))),
-        )
-    }
-
-    /// Fetches a newer list from the current list's refresh URL, through the proxy, and keeps
-    /// it only if its signature checks against the keys compiled in.
-    pub fn refresh_peer_list(&self, network: &str) -> String {
-        let net = match parse_net(network) {
-            Ok(n) => n,
-            Err(e) => return reply::err(e),
-        };
-        let (url, route, proxy, current) = {
-            let inner = self.lock();
-            let Some(cfg) = inner.cfg(net) else { return reply::err(not_configured(net)) };
-            let current = cfg.peer_list(net);
-            let Some(url) = current.refresh_url.clone() else {
-                return reply::err(format!("the {} peer list has no refresh URL yet: the curated list is not published", net.name()));
-            };
-            let route = route_for(&addr::host_of(&url), true);
-            let proxy = inner.store.proxy().map(String::from);
-            if route != Route::Direct && proxy.is_none() {
-                return reply::err(NO_PROXY);
-            }
-            (url, route, proxy.filter(|_| route != Route::Direct), current)
-        };
-        let (done, rx) = mpsc::channel();
-        if let Err(e) = self.submit(Job::Fetch { url, route, proxy, done }) {
-            return reply::err(e);
-        }
-        let body = match rx.recv_timeout(CALL_BUDGET) {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => return reply::err(e),
-            Err(_) => return reply::err("the peer list did not arrive in time"),
-        };
-        let fetched = match peers::accept(net, &current, &body, self.verify) {
-            Ok(l) => l,
-            Err(e) => return reply::err(e),
-        };
-        self.mutate(
-            true,
-            |store, _| {
-                let cfg = store.networks.get_mut(&net).ok_or_else(|| not_configured(net))?;
-                let newer = fetched.version > cfg.peer_list(net).version;
-                if newer {
-                    cfg.peer_list = Some(fetched);
-                }
-                Ok((newer, vec![]))
-            },
-            |inner, updated| match inner.cfg(net) {
-                Some(c) => {
-                    let mut v = inner.peer_list_value(net, c);
-                    v["updated"] = json!(updated);
-                    reply::ok(v)
-                }
-                None => reply::err(not_configured(net)),
-            },
         )
     }
 

@@ -1,8 +1,8 @@
 # logos-bitcoin-node-module
 
 `bitcoin_node_module`: the sources a Bitcoin wallet uses, per network. It keeps each
-network's source list and one Tor proxy, answers a route table per role, keeps Kyoto's peer
-lists, and probes every enabled server's health with address-free calls. It holds no keys and
+network's source list and one Tor proxy, answers a route table per role, keeps a book of Kyoto's
+peers, and probes every enabled server's health with address-free calls. It holds no keys and
 carries no wallet traffic.
 
 Networks: `mainnet`, `testnet4`, `signet`, and `regtest` when the instance persistence
@@ -86,7 +86,7 @@ pin one with `certSha256` to use it.
 - `broadcast`: the local node, then Kyoto; only when neither is on, the history servers.
 - `check`: every server, asked for tips and headers only.
 
-Plus `proxy`, `peers` (every peer Kyoto's route can use), `crossCheck` (two operators among
+Plus `proxy`, `peers` (Kyoto's peers, below), `crossCheck` (two operators among
 chain and check) and `unrouted` (enabled sources left out, and why: no proxy, suspect, wrong
 network). A disabled source is never routed. Entries carry `certSha256` when the source has a
 pin, and `userAdded` for a server the person added: the wallet core speaks plain text only to
@@ -94,24 +94,46 @@ such a server on the person's network.
 
 ## Kyoto's peers
 
-The curated list per network is `rust-lib/peer-lists/<network>.json`, written by the crawler
-(logos-bitcoin-peer-list): format 1, a `version`, when it was signed (`created`), the day of
-its last run (`date`), a refresh URL, onion v3 peers as `host:port`, a key id, and an Ed25519
-signature over `logos-bitcoin-peer-list/1\n` followed by the list as compact JSON in field
-order with `signature` null. A list is used only if its signature checks against a key compiled
-into this build (`rust-lib/keys/`): today that is the crawler's **TEST key**, and the release
-key is not chosen yet. A shipped list that fails is replaced by an empty one that says why.
+The curated list per network is `rust-lib/peer-lists/<network>.json`, written at release time
+by the crawler (logos-bitcoin-peer-list, `peer-list release`): format 1, a `version`, when it
+was signed (`created`), the day of its last run (`date`), a note, onion v3 peers as
+`host:port`, a key id, and an Ed25519 signature over `logos-bitcoin-peer-list/1\n` followed by
+the list as compact JSON in field order with `signature` null (`refreshUrl` stays in the format,
+null). A list is used only if its signature checks against a key compiled into this build
+(`rust-lib/keys/`): today that is the crawler's **TEST key**, and the release key is not chosen
+yet. A shipped list that fails is replaced by an empty one that says why. The shipped lists are
+**provisional**: each note says how many runs it comes from. Nothing is fetched: a newer list
+comes with a newer build.
 
-The shipped mainnet and signet lists are **provisional**: each list's note says how many runs
-it comes from, fewer than the plan's 6 of 7 days. Testnet4's holds the one onion peer the
-crawler found, which answered the handshake and getcfheaders; the plan has it point at our own
-filter-serving nodes, which nobody runs yet. Your own peers (`set_own_peers`) replace the list. Kyoto has one connection type
-for every peer, so your network's peers and peers through Tor don't mix, and an onion peer needs
-Tor. `route_table` lists every usable peer; the wallet core draws 8 at random per start and
-skips a peer that keeps failing. `refresh_peer_list` fetches a newer list through the proxy and
-keeps it only if it is for this network, has a higher version and its signature checks. A kept
-list is checked again whenever the module starts, and is used only while it is newer than the
-one this build ships.
+Each install keeps its own book per network, `kyoto_peers_<network>.json` in the persistence
+directory (atomic, owner-only): entries `{ addr, port, services, source: list|learned|seed,
+from?, firstSeen, lastSeen, lastOk, okCount, failStreak, skipUntil }`, services and Unix times
+as decimal strings, `lastOk` and `skipUntil` null when unset. The shipped list seeds it as
+`list`; a peer that a newer build's list drops leaves the book. At most 2,000 entries, and 64
+learned from any one `from`. A learned peer that never worked is dropped after 7 days, and any
+learned peer without a success in 30 days.
+
+- `report_peers(network, reportJson)`, wallet core only: `{ outcomes: [{ peer, ok, reason? }],
+  learned: [{ addr, port, services, seenAt, from }] }`, at most 500 of each. Success sets
+  `lastOk`, counts and clears the streak; the third failure in a row skips the peer for 24 h.
+  A learned peer is kept if it is onion v3 (on regtest, on your network), serves bits 0, 3 and
+  6, and was seen within 3 days.
+- `route_table(network).peers`: `[{ peer, source, ok }]`, `ok` if it ever worked, most recent
+  success first, then list before learned. Skipped peers are left out unless every peer is
+  skipped. Your own peers (`set_own_peers`) replace the book, as `source: "own"`. Kyoto has one
+  connection type for every peer, so your network's peers and peers through Tor don't mix, and
+  an onion peer needs Tor.
+- `peer_list(network)`: the signed list, own peers, `usable` (as `peers`) and `counts: { list,
+  learned, seed, usable, okLast30d }`.
+
+Bitcoin Core 31.1's fixed seeds, onion v3 only, ship as `peer-lists/seeds-<network>.json`
+(`peer-list seeds` from Core's `contrib/seeds`) and enter the book as `seed`; they never go to
+Kyoto. When fewer than 12 usable peers worked in the last 30 days, the health thread asks up to
+8 seeds over Tor (version handshake, `sendaddrv2`, one `getaddr`) and keeps what they gossip
+by the rules above, as learned with `from` the seed: at most once a day per network, and only
+while a wallet is open there, with Kyoto on, no own peers and a proxy. On regtest,
+`regtest.json` may name loopback or LAN seeds, reached directly: `{ "harvestSeeds":
+["127.0.0.1:18444"] }`.
 
 ## Health
 
@@ -128,17 +150,20 @@ its peers today, and `local_node` asks bitcoind_module (logos-bitcoind-module) f
 
 ## Callers
 
-`bitcoin_wallet_backend` may change sources, the proxy and own peers, clear suspects, refresh
-the peer list, and say a wallet is open (`set_wallet_open`), which locks that network's
+`bitcoin_wallet_backend` may change sources, the proxy and own peers, clear suspects, and say
+a wallet is open (`set_wallet_open`), which locks that network's
 settings and the proxy until it closes. The backend and `bitcoin_wallet_core_module` may read
 routes and report a mismatch, which marks a source suspect until the backend clears it. Only
-the wallet core reads credentials. Reads are open. `callers.json` in the persistence directory
+the wallet core reads credentials and reports on Kyoto's peers. Reads are open. `callers.json` in the persistence directory
 widens the gate for tests. Events: `source_health_changed`, `routes_changed`, `source_suspect`.
-u64 values cross as decimal strings. Persists `bitcoin_sources.json`, atomically, owner-only.
+u64 values cross as decimal strings. Persists `bitcoin_sources.json` and the peer books,
+atomically, owner-only.
 
 ```bash
 cd rust-lib && cargo test --no-default-features
 BITCOIN_TEST_TOR=socks5h://127.0.0.1:9050 cargo test --no-default-features --test live -- --ignored --nocapture
+# The harvest against a regtest bitcoind it starts itself (31.x), its address book filled first
+BITCOIND=/path/to/bitcoind cargo test --no-default-features --test regtest -- --ignored harvest --nocapture
 ```
 
 ## Windows

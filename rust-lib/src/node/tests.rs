@@ -58,6 +58,11 @@ fn route_of(v: &Value, role: &str, id: &str) -> String {
     v[role].as_array().unwrap().iter().find(|r| r["id"] == id).map(|r| r["route"].as_str().unwrap().to_string()).unwrap_or_default()
 }
 
+/// The `peer` of each route_table `peers` entry (or peer_list `usable`).
+fn peer_strings(v: &Value) -> Vec<String> {
+    v.as_array().unwrap().iter().map(|p| p["peer"].as_str().unwrap().to_string()).collect()
+}
+
 fn onion() -> String {
     format!("{}.onion", "a2".repeat(28))
 }
@@ -120,7 +125,8 @@ fn the_default_route_table() {
     assert_eq!((route_of(&rt, "fees", "blockstream.info-onion"), route_of(&rt, "chain", "kyoto")), ("onion".into(), "onion".into()));
     assert_eq!(rt["crossCheck"], true);
     let shipped = peers::shipped(BNetwork::Mainnet);
-    assert_eq!(rt["peers"], json!(shipped.peers), "the whole curated list: the wallet core picks its own 8");
+    assert_eq!(peer_strings(&rt["peers"]), shipped.peers, "the whole curated list: the wallet core picks its own 8");
+    assert!(rt["peers"].as_array().unwrap().iter().all(|p| p["source"] == "list" && p["ok"] == false), "none worked yet");
     assert_eq!(rt["unrouted"], json!([]));
     let entry = &rt["fees"][0];
     assert_eq!(entry.as_object().unwrap().keys().cloned().collect::<Vec<_>>(), ["id", "kind", "operator", "route", "url"]);
@@ -195,16 +201,20 @@ fn kyoto_routes_with_its_peers() {
     let peers = |n: &str| v(h.node.peer_list(n));
     let p = peers("signet");
     let shipped = peers::shipped(BNetwork::Signet);
-    assert_eq!((p["route"].as_str(), &p["source"], &p["list"]["version"]), (Some("onion"), &json!("shipped"), &json!(shipped.version.to_string())));
-    assert_eq!(p["usable"], json!(shipped.peers));
+    assert_eq!((p["route"].as_str(), &p["list"]["version"]), (Some("onion"), &json!(shipped.version.to_string())));
+    assert_eq!(peer_strings(&p["usable"]), shipped.peers);
+    // A fixed seed the list also names counts as a list peer.
+    let seeds = peers::fixed_seeds(BNetwork::Signet).iter().filter(|p| !shipped.peers.contains(p)).count();
+    assert_eq!(p["counts"], json!({"list": shipped.peers.len(), "learned": 0, "seed": seeds, "usable": shipped.peers.len(), "okLast30d": 0}));
     let kh = &v(h.node.source_health("signet"))["sources"][0];
     assert_eq!((kh["state"].as_str(), kh["peers"].as_str()), (Some("not_probed"), Some(shipped.peers.len().to_string().as_str())));
     // Your node on your network: Kyoto dials it directly, and needs no proxy.
     let p = v(h.node.set_own_peers("signet", r#"["192.168.1.20"]"#));
-    assert_eq!((p["ownPeers"].clone(), p["usable"].clone(), p["route"].as_str()), (json!(["192.168.1.20:38333"]), json!(["192.168.1.20:38333"]), Some("direct")));
+    let own = json!([{"peer": "192.168.1.20:38333", "source": "own", "ok": false}]);
+    assert_eq!((p["ownPeers"].clone(), p["usable"].clone(), p["route"].as_str()), (json!(["192.168.1.20:38333"]), own.clone(), Some("direct")));
     h.node.set_proxy("");
     let rt = v(h.node.route_table("signet"));
-    assert_eq!((ids(&rt, "chain"), route_of(&rt, "chain", "kyoto"), rt["peers"].clone()), (vec!["kyoto".to_string()], "direct".into(), json!(["192.168.1.20:38333"])));
+    assert_eq!((ids(&rt, "chain"), route_of(&rt, "chain", "kyoto"), rt["peers"].clone()), (vec!["kyoto".to_string()], "direct".into(), own));
     assert_eq!(v(h.node.get_sources("signet"))["sources"][0]["lan"], true);
     let kh = &v(h.node.source_health("signet"))["sources"][0];
     assert_eq!((kh["state"].as_str(), kh["peers"].as_str()), (Some("not_probed"), Some("1")));
@@ -384,9 +394,92 @@ fn many_peers_of_your_own() {
     let onions: Vec<String> = (0..23).map(|i| format!("{}{}{}.onion:38333", "a2".repeat(27), B32[i / 32] as char, B32[i % 32] as char)).collect();
     let p = v(h.node.set_own_peers("signet", &serde_json::to_string(&onions).unwrap()));
     assert_eq!((p["ownPeers"].as_array().map(Vec::len), &p["route"]), (Some(23), &json!("onion")), "{p}");
-    assert_eq!(v(h.node.route_table("signet"))["peers"], json!(onions), "your peers replace the list, all of them");
+    assert_eq!(peer_strings(&v(h.node.route_table("signet"))["peers"]), onions, "your peers replace the list, all of them");
     let again = Node::open(Some(h.dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
     assert_eq!(v(again.peer_list("signet"))["ownPeers"], json!(onions), "kept across a restart");
+}
+
+/// A valid onion v3 name for `n` (checksum and all).
+fn onion_v3(n: u8) -> String {
+    crate::net::p2p::onion_from_key(&[n; 32])
+}
+
+#[test]
+fn the_wallet_core_reports_on_kyotos_peers() {
+    let h = configured();
+    let shipped = peers::shipped(BNetwork::Signet);
+    let (a, b) = (shipped.peers[0].clone(), shipped.peers[1].clone());
+    let report = |j: Value| v(h.node.report_peers("signet", &j.to_string()));
+    let r = report(json!({"outcomes": [{"peer": a, "ok": true}, {"peer": b, "ok": false, "reason": "timeout"}, {"peer": format!("{}:38333", onion_v3(1)), "ok": true}]}));
+    assert_eq!(r["outcomes"], json!({"applied": 2, "unknown": 1}), "{r}");
+    h.take();
+    // The third failure in a row skips b for 24 h, and the routes say so.
+    report(json!({"outcomes": [{"peer": b, "ok": false}, {"peer": b, "ok": false}]}));
+    assert!(h.take().contains(&"routes signet".to_string()));
+    let rt = v(h.node.route_table("signet"));
+    let listed = peer_strings(&rt["peers"]);
+    assert!(!listed.contains(&b) && listed.len() == shipped.peers.len() - 1);
+    assert_eq!(rt["peers"][0], json!({"peer": a, "source": "list", "ok": true}), "the peer that worked first");
+    // Learned peers: onion v3 with bits 0, 3 and 6, seen within 3 days; the rest refused.
+    let seen = now().to_string();
+    let learned = json!([
+        {"addr": onion_v3(2), "port": 38333, "services": 1097, "seenAt": seen, "from": a},
+        {"addr": "203.0.113.5", "port": 38333, "services": 73, "seenAt": now(), "from": a},
+        {"addr": onion_v3(3), "port": 38333, "services": 9, "seenAt": now(), "from": a},
+        {"addr": onion_v3(4), "port": 38333, "services": 73, "seenAt": now() - 4 * 86_400, "from": a},
+    ]);
+    let r = report(json!({"learned": learned}));
+    assert_eq!((&r["learned"], &r["counts"]["learned"]), (&json!({"added": 1, "updated": 0, "refused": 3}), &json!(1)), "{r}");
+    let entry = v(h.node.route_table("signet"))["peers"].as_array().unwrap().iter().find(|p| p["peer"] == format!("{}:38333", onion_v3(2))).cloned();
+    assert_eq!(entry, Some(json!({"peer": format!("{}:38333", onion_v3(2)), "source": "learned", "ok": false})));
+    // Refusals of the whole report.
+    for bad in [r#"{"outcomes":"x"}"#.to_string(), "[]".into(), format!(r#"{{"learned":[{{"addr":"{}"}}]}}"#, onion_v3(5))] {
+        assert!(v(h.node.report_peers("signet", &bad))["error"].as_str().unwrap().starts_with("invalid parameters: report:"), "{bad}");
+    }
+    assert_eq!(v(h.node.report_peers("testnet3", "{}"))["error"], "network must be mainnet, testnet4 or signet");
+    // Kept across a restart: records, skips and learned peers.
+    let again = Node::open(Some(h.dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
+    assert_eq!(again.route_table("signet"), h.node.route_table("signet"));
+    let c = v(again.peer_list("signet"))["counts"].clone();
+    assert_eq!((&c["learned"], &c["okLast30d"], &c["usable"]), (&json!(1), &json!(1), &json!(shipped.peers.len())));
+    let book: Value = serde_json::from_slice(&std::fs::read(h.dir.path().join("kyoto_peers_signet.json")).unwrap()).unwrap();
+    let rec = book["entries"].as_array().unwrap().iter().find(|e| format!("{}:{}", e["addr"].as_str().unwrap(), e["port"]) == b).cloned().unwrap();
+    assert!(rec["skipUntil"].is_string() && rec["failStreak"] == 0 && rec["source"] == "list", "{rec}");
+}
+
+#[test]
+fn the_fixed_seeds_are_asked_only_when_the_book_runs_short() {
+    let h = configured();
+    assert!(h.node.harvest_plan().is_empty(), "no wallet open");
+    h.node.set_wallet_open("signet", true);
+    let plan = h.node.harvest_plan();
+    assert_eq!(plan.len(), 1);
+    assert_eq!((plan[0].network, plan[0].seeds.len(), plan[0].proxy.as_deref()), (BNetwork::Signet, 8, Some(TOR)));
+    assert!(plan[0].seeds.iter().all(|(p, r)| *r == Route::Onion && peers::fixed_seeds(BNetwork::Signet).contains(p)));
+    assert!(h.node.harvest_plan().is_empty(), "once a day");
+    // What a seed gossiped becomes learned, credited to it.
+    let seed = plan[0].seeds[0].0.clone();
+    let g = |host: String, services: u64| Gossip { host, port: 38333, services, time: now() as u32 };
+    let l = h.node.record_harvest(BNetwork::Signet, &seed, &[g(onion_v3(9), 0x49), g("203.0.113.5".into(), 0x49), g(onion_v3(10), 0x09)]);
+    assert_eq!((l.added, l.refused), (1, 2));
+    let book: Value = serde_json::from_slice(&std::fs::read(h.dir.path().join("kyoto_peers_signet.json")).unwrap()).unwrap();
+    let e = book["entries"].as_array().unwrap().iter().find(|e| e["addr"] == onion_v3(9)).cloned().unwrap();
+    assert_eq!((&e["source"], &e["from"]), (&json!("learned"), &json!(seed)));
+    assert!(book["harvestedAt"].is_string());
+    // Not with your own peers, nor without the proxy, nor once 12 peers worked this month.
+    let own = configured();
+    own.node.set_own_peers("signet", r#"["192.168.1.20"]"#);
+    own.node.set_wallet_open("signet", true);
+    let off = configured();
+    off.node.set_proxy("");
+    off.node.set_wallet_open("signet", true);
+    let fine = configured();
+    let outcomes: Vec<Value> = peers::shipped(BNetwork::Mainnet).peers.iter().take(12).map(|p| json!({"peer": p, "ok": true})).collect();
+    fine.node.report_peers("mainnet", &json!({"outcomes": outcomes}).to_string());
+    fine.node.set_wallet_open("mainnet", true);
+    for (name, n) in [("own peers", &own), ("no proxy", &off), ("12 worked", &fine)] {
+        assert!(n.node.harvest_plan().is_empty(), "{name}");
+    }
 }
 
 #[test]
@@ -447,10 +540,9 @@ fn local_node() {
 }
 
 #[test]
-fn probe_and_refresh_need_the_health_thread() {
+fn probe_needs_the_health_thread() {
     let h = configured();
     assert_eq!(v(h.node.probe("signet", "blockstream.info-onion"))["error"], "the health thread is not running");
-    assert!(v(h.node.refresh_peer_list("mainnet"))["error"].as_str().unwrap().contains("no refresh URL"));
     assert_eq!(v(h.node.probe("signet", "nope"))["error"], "unknown source nope");
     // Kyoto and the local node are not dialled by this module: their state answers at once.
     let p = v(h.node.probe("signet", KYOTO_ID));
@@ -578,51 +670,3 @@ fn probes_go_through_the_health_thread() {
     assert!(poller.stop(Duration::from_millis(1000)));
 }
 
-#[test]
-fn refresh_keeps_a_newer_list_only_when_its_signature_checks() {
-    use crate::peers::tests::{sign_fixture, signed, verify_fixture};
-    let srv = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://127.0.0.1:{}/peers.json", srv.local_addr().unwrap().port());
-    let base = peers::shipped(BNetwork::Signet).version;
-    // A stored list that names where newer ones are published, and the newer one served there.
-    let stored = sign_fixture(PeerList { refresh_url: Some(url.clone()), ..signed(BNetwork::Signet, base + 1, "stored") });
-    let served = sign_fixture(PeerList { refresh_url: Some(url.clone()), ..signed(BNetwork::Signet, base + 2, "served") });
-    let body = serde_json::to_string(&served).unwrap();
-    std::thread::spawn(move || {
-        for s in srv.incoming().flatten() {
-            let mut s = s;
-            let mut buf = [0u8; 2048];
-            let _ = s.read(&mut buf);
-            let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
-        }
-    });
-    // The fixture key checks both lists; a build that trusts only the stored one refuses the
-    // served one; this build's own keys drop the fixture-signed stored list when it opens.
-    let only_stored: Verify = |l| if l.note == "stored" { Ok(()) } else { peers::verify(l) };
-    for (verify, case) in [(verify_fixture as Verify, "kept"), (only_stored, "refused"), (peers::verify as Verify, "dropped")] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(crate::store::FILE_NAME);
-        let mut store = Store::empty();
-        store.proxy = Some(None);
-        let mut cfg = NetConfig::seeded(BNetwork::Signet);
-        cfg.peer_list = Some(stored.clone());
-        store.networks.insert(BNetwork::Signet, cfg);
-        store.save(&path).unwrap();
-        let node = Node::open_with(Some(path), Arc::new(|_| {}), verify);
-        let poller = crate::poll::Poller::start(node.clone()).unwrap();
-        let r = v(node.refresh_peer_list("signet"));
-        let now = v(node.peer_list("signet"));
-        match case {
-            "kept" => assert_eq!((&r["updated"], &r["list"]["version"], &r["source"]), (&json!(true), &json!((base + 2).to_string()), &json!("fetched")), "{r}"),
-            "refused" => {
-                assert!(r["error"].as_str().unwrap().contains("unknown key fixture-1"), "{r}");
-                assert_eq!((&now["list"]["version"], &now["source"]), (&json!((base + 1).to_string()), &json!("fetched")));
-            }
-            _ => {
-                assert!(r["error"].as_str().unwrap().contains("no refresh URL"), "{r}");
-                assert_eq!((&now["list"]["version"], &now["source"]), (&json!(base.to_string()), &json!("shipped")));
-            }
-        }
-        assert!(poller.stop(Duration::from_millis(1000)));
-    }
-}

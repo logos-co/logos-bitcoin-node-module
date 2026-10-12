@@ -9,7 +9,7 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 use crate::network::{networks, BNetwork};
-use crate::peers::{self, PeerList};
+use crate::peers;
 use crate::proxy;
 use crate::sources::{self, Kind, Source};
 use crate::strnum::{de, de_opt, double_option, ser, ser_opt};
@@ -37,14 +37,11 @@ pub struct NetConfig {
     /// Kyoto dials only these when there are any.
     #[serde(default)]
     pub own_peers: Vec<String>,
-    /// A fetched list newer than the shipped one, kept once its signature checked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_list: Option<PeerList>,
 }
 
 impl NetConfig {
     pub fn seeded(net: BNetwork) -> Self {
-        Self { sources: sources::defaults(net), suspects: BTreeMap::new(), own_peers: vec![], peer_list: None }
+        Self { sources: sources::defaults(net), suspects: BTreeMap::new(), own_peers: vec![] }
     }
 
     pub fn source(&self, id: &str) -> Option<&Source> {
@@ -54,12 +51,6 @@ impl NetConfig {
     /// Kyoto's Tor switch, on when Kyoto is not in the list.
     pub fn kyoto_tor(&self) -> bool {
         self.sources.iter().find(|s| s.kind == Kind::Kyoto).is_none_or(|s| s.tor)
-    }
-
-    /// The list Kyoto picks from: a fetched one while it is newer than this build's.
-    pub fn peer_list(&self, net: BNetwork) -> PeerList {
-        let shipped = peers::shipped(net);
-        self.peer_list.clone().filter(|l| l.version > shipped.version).unwrap_or(shipped)
     }
 
     /// Replaces the list, keeping only the suspicions of sources still at the same url.
@@ -81,9 +72,6 @@ impl NetConfig {
             }
         }
         peers::check_own(&self.own_peers, self.kyoto_tor())?;
-        if let Some(l) = &self.peer_list {
-            l.validate(net)?;
-        }
         match self.suspects.keys().find(|id| self.source(id).is_none()) {
             Some(id) => Err(format!("suspect {id} is not a source")),
             None => Ok(()),

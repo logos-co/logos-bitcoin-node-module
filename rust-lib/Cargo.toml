@@ -26,6 +26,8 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Onion v3 names from BIP155 keys (the checksum is SHA3-256).
+sha3 = "0.10"
 # Already in the tree through tokio-rustls; verifies the peer lists' Ed25519 signatures.
 ring = "0.17"
 # Already in the tree through rustls: a pinned certificate's handshake signature, from its own key.

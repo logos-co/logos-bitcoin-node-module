@@ -1,4 +1,4 @@
-//! HTTP/1.1 GETs over a stream `dial` opened: Esplora servers and peer list updates.
+//! HTTP/1.1 GETs over a stream `dial` opened: Esplora servers.
 
 use base64::Engine;
 use http::{header, Request, StatusCode};
@@ -80,16 +80,6 @@ impl Conn {
         }
         Ok(text)
     }
-}
-
-/// One GET of a whole URL, as a peer list update is fetched.
-pub async fn fetch(url: &str, route: Route, proxy: Option<&ProxyAddr>, iso: &Isolation, limit: usize) -> Result<Bytes, String> {
-    let mut c = Conn::open(url, None, route, proxy, iso, None).await.map_err(|(e, _)| e)?;
-    let (status, body) = c.get("", limit).await?;
-    if status != StatusCode::OK {
-        return Err(format!("{url}: HTTP {}", status.as_u16()));
-    }
-    Ok(body)
 }
 
 #[cfg(test)]

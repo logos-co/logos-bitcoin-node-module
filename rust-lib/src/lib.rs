@@ -2,6 +2,7 @@
 //! the route table per role, Kyoto's peer lists and address-free health probes.
 
 pub mod addr;
+pub mod book;
 pub mod gate;
 pub mod health;
 pub mod net;

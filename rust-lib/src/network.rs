@@ -78,6 +78,16 @@ impl BNetwork {
         }
     }
 
+    /// The P2P message start bytes.
+    pub fn magic(self) -> [u8; 4] {
+        match self {
+            BNetwork::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
+            BNetwork::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
+            BNetwork::Signet => [0x0a, 0x03, 0xcf, 0x40],
+            BNetwork::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
+        }
+    }
+
     /// Bitcoin Core's default P2P port, for a peer given without one.
     pub fn p2p_port(self) -> u16 {
         match self {

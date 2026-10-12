@@ -1,5 +1,6 @@
 //! Who may call what: reads are open, changes take the wallet backend, routes and mismatch
-//! reports also the wallet core, credentials the wallet core only. callers.json widens it.
+//! reports also the wallet core, credentials and Kyoto's peer reports the wallet core only.
+//! callers.json widens it.
 
 use serde::Deserialize;
 

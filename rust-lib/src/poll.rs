@@ -1,5 +1,6 @@
 //! The health thread: probes every enabled server once a minute, four at a time, one Tor
-//! circuit each, and runs the probes and peer list fetches callers hand it.
+//! circuit each, runs the probes callers hand it, and asks fixed seeds for peers when a
+//! peer book runs short.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,16 +13,21 @@ use futures_util::{stream, StreamExt};
 use tokio::sync::Notify;
 
 use crate::health::{Health, State};
+use crate::net::client::{dial, Route};
+use crate::net::p2p::{Gossip, Peer};
 use crate::net::socks::{Isolation, ProxyAddr};
-use crate::net::{electrum, esplora, http};
-use crate::node::{now, Job, Node, Target};
-use crate::peers;
+use crate::net::{electrum, esplora};
+use crate::network::BNetwork;
+use crate::node::{now, Harvest, Job, Node, Target};
 use crate::sources::{self, Kind};
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// A cold onion circuit took 27 s for the Zcash module; this leaves room for that.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(50);
 pub const MAX_CONCURRENT: usize = 4;
+/// One fixed seed: the onion connection, the handshake and the getaddr answer.
+pub const HARVEST_TIMEOUT: Duration = Duration::from_secs(90);
+const GETADDR_WINDOW: Duration = Duration::from_secs(15);
 
 pub struct Poller {
     stop: Arc<AtomicBool>,
@@ -101,6 +107,9 @@ fn run(node: &Arc<Node>, rx: tokio::sync::mpsc::UnboundedReceiver<Job>, stop: &A
                 _ = cycle(node, &mut prober) => {}
                 _ = stop_notify.notified() => break,
             }
+            for h in node.harvest_plan() {
+                tokio::spawn(harvest(node.clone(), h));
+            }
             tokio::select! {
                 _ = tokio::time::sleep_until(next) => {}
                 _ = node.wake().notified() => {}
@@ -136,23 +145,38 @@ async fn run_job(node: Arc<Node>, job: Job) {
             node.flush();
             let _ = done.send(());
         }
-        Job::Fetch { url, route, proxy, done } => {
-            let proxy = match proxy.as_deref().map(ProxyAddr::parse).transpose() {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = done.send(Err(e));
-                    return;
-                }
-            };
-            let iso = Isolation::fresh();
-            let fetched = http::fetch(&url, route, proxy.as_ref(), &iso, peers::MAX_LIST_BYTES);
-            let r = match tokio::time::timeout(PROBE_TIMEOUT, fetched).await {
-                Ok(r) => r.map(|b| b.to_vec()),
-                Err(_) => Err("timed out".into()),
-            };
-            let _ = done.send(r);
+    }
+}
+
+/// Asks each seed of `h` for addresses, four at a time, and records what passes.
+pub async fn harvest(node: Arc<Node>, h: Harvest) -> usize {
+    let proxy = h.proxy.as_deref().and_then(|p| ProxyAddr::parse(p).ok());
+    let net = h.network;
+    let mut asked = stream::iter(h.seeds)
+        .map(|(seed, route)| {
+            let proxy = proxy.clone();
+            async move {
+                let r = tokio::time::timeout(HARVEST_TIMEOUT, ask(&seed, route, proxy.as_ref(), net)).await;
+                (seed, r.unwrap_or_else(|_| Err("timed out".into())))
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT);
+    let mut learned = 0;
+    while let Some((seed, r)) = asked.next().await {
+        if let Ok(gossip) = r {
+            learned += node.record_harvest(net, &seed, &gossip).added;
         }
     }
+    learned
+}
+
+/// A version handshake with `seed`, sendaddrv2, and one getaddr.
+async fn ask(seed: &str, route: Route, proxy: Option<&ProxyAddr>, net: BNetwork) -> Result<Vec<Gossip>, String> {
+    let (host, port) = seed.rsplit_once(':').ok_or("a seed without a port")?;
+    let port = port.parse::<u16>().map_err(|_| "a seed with a bad port")?;
+    let stream = dial(host.trim_start_matches('[').trim_end_matches(']'), port, route, proxy, &Isolation::fresh()).await.map_err(|e| e.to_string())?;
+    let (mut peer, _) = Peer::handshake(stream, net, now()).await?;
+    peer.getaddr(GETADDR_WINDOW).await
 }
 
 /// The circuit of one server for the session: fixed SOCKS credentials, and whether its
