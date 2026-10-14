@@ -2,7 +2,7 @@
 
 use base64::Engine;
 use http::{header, Request, StatusCode};
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 
@@ -16,7 +16,7 @@ pub const USER_AGENT: &str = "Mozilla/5.0";
 
 /// One keep-alive connection to an http(s) base URL.
 pub struct Conn {
-    sender: hyper::client::conn::http1::SendRequest<Empty<Bytes>>,
+    sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
     host: String,
     base: String,
     auth: Option<String>,
@@ -64,11 +64,31 @@ impl Conn {
         if let Some(a) = &self.auth {
             req = req.header(header::AUTHORIZATION, a);
         }
-        let req = req.body(Empty::new()).map_err(|e| format!("http: {e}"))?;
+        let req = req.body(Full::new(Bytes::new())).map_err(|e| format!("http: {e}"))?;
         let resp = self.sender.send_request(req).await.map_err(|e| format!("http: {e}"))?;
         let status = resp.status();
         let body = Limited::new(resp.into_body(), limit).collect().await.map_err(|e| format!("http body: {e}"))?.to_bytes();
         Ok((status, body))
+    }
+
+    /// JSON-RPC POST to the configured endpoint; never follows redirects.
+    pub async fn rpc(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.sender.ready().await.map_err(|e| format!("http: {e}"))?;
+        let body = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}).to_string();
+        let mut req = Request::post(if self.base.is_empty() { "/" } else { &self.base })
+            .header(header::HOST, &self.host).header(header::USER_AGENT, USER_AGENT)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(a) = &self.auth { req = req.header(header::AUTHORIZATION, a); }
+        let resp = self.sender.send_request(req.body(Full::new(Bytes::from(body))).map_err(|_| "invalid RPC request")?)
+            .await.map_err(|e| format!("http: {e}"))?;
+        let status = resp.status();
+        if status != StatusCode::OK && status != StatusCode::INTERNAL_SERVER_ERROR {
+            return Err(format!("RPC HTTP {}", status.as_u16()));
+        }
+        let body = Limited::new(resp.into_body(), 4 * 1024 * 1024).collect().await.map_err(|_| "RPC response too large or incomplete")?.to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| "RPC response is not JSON")?;
+        if v["id"] != 1 { return Err("RPC response ID mismatch".into()); }
+        Ok(v)
     }
 
     /// GET whose answer must be 200 and short UTF-8 text, returned trimmed.

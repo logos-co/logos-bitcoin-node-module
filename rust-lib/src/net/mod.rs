@@ -7,3 +7,5 @@ pub mod esplora;
 pub mod http;
 pub mod p2p;
 pub mod socks;
+
+pub mod rpc;
