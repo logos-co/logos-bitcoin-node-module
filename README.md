@@ -18,9 +18,10 @@ the route are computed. Kinds:
 | `kyoto` | `p2p://peer-list` (id `kyoto`) | chain, history (through block filters), fees (block averages), broadcast |
 | `electrum` | `ssl://host:port` (50002), or `tcp://host:port` (50001) for onion services and your network | history and pending when `history` is on, fees, check, and the chain when Kyoto and the local node are off |
 | `esplora` | `https://host[:port][/path]`, or `http://` for onion services and your network | history and pending when `history` is on, fees, check |
+| `rpc` | `https://host[:port][/path]`, or `http://` for onion services and your network | chain, locally scanned history and pending, fees, broadcast |
 | `local` | `logos://bitcoind_module` (id `local`, stage 2) | chain, history, pending, fees, broadcast |
 
-- `history` means the source is asked about the wallet's addresses. Servers only. Every reply
+- `history` means the source is asked about the wallet's addresses. Electrum and Esplora only; RPC never receives wallet addresses. Every reply
   that changes sources carries `exposes`, the enabled sources that learn the addresses.
 - `tor` is per source and on by default. Turning it off is refused for an onion service. A
   source reached without Tor by choice is listed in `withoutTor`.
@@ -31,7 +32,7 @@ the route are computed. Kinds:
   connection.
 - Operators, not hosts, count: a user-added server defaults to its registered domain
   (`you` on your network), unless the caller names one.
-- An Esplora server may take HTTP basic auth (`https://user:pw@host/api`, or `credentials`).
+- An Esplora or RPC server may take HTTP basic auth (`https://user:pw@host/api`, or `credentials`).
   No read returns it; `get_sources` says `hasCredentials`, and only the wallet core reads it,
   with `source_credentials`. A list sent back without credentials keeps the stored ones.
 - Plain `tcp://` or `http://` is only for an onion service or a server on your network, as in
@@ -47,11 +48,13 @@ the route are computed. Kinds:
 
 `init_defaults` fills what is absent, field by field: the proxy `socks5h://127.0.0.1:9050`,
 and per network Kyoto on, one server for fee rates only (history off), and every other source
-off. There are no presets; sources are switched on one by one.
+off. Sources are switched on one by one. PublicNode RPC is disabled and direct by default.
+Existing mainnet configurations gain this disabled catalog entry on load, preserving existing
+settings and avoiding a duplicate when the endpoint was already added manually.
 
 | Network | Fee server (on) | Off, ready to switch on |
 |---|---|---|
-| mainnet | Blockstream Esplora, onion | blockstream.info, both mempool.space addresses, Blockstream Electrum (TLS and onion) |
+| mainnet | Blockstream Esplora, onion | PublicNode Bitcoin Core RPC (direct), blockstream.info, both mempool.space addresses, Blockstream Electrum (TLS and onion) |
 | signet | Blockstream Esplora, onion | blockstream.info, both mempool.space addresses |
 | testnet4 | an Electrum onion service (Fulcrum, plain tcp over Tor) | stagemole.eu and c3-soft.com Electrum (TLS) |
 | regtest | none | only your own sources |
@@ -77,14 +80,17 @@ pin one with `certSha256` to use it.
 `route_table(network)` gives one list per role, each `{ id, kind, url, operator, route }` with
 `route` `tor`, `direct` or `onion`, in failover order:
 
-- `chain`: the local node, then Kyoto; only when neither is on, every Electrum server (the
+- `chain`: the local node, then one enabled RPC endpoint, then Kyoto; only when neither is on, every Electrum server (the
   most-work chain wins). It follows what is switched on, so an unreachable Kyoto never hands
   the chain to a server.
-- `history`: the local node and Kyoto, which learn no address, then servers with history on.
-- `pending`: the local node, then servers with history on.
-- `fees`: the local node, every server, then Kyoto.
-- `broadcast`: the local node, then Kyoto; only when neither is on, the history servers.
-- `check`: every server, asked for tips and headers only.
+- `history`: the local node, RPC and Kyoto, which learn no address, then servers with history on.
+- `pending`: the local node and RPC, then servers with history on.
+- `fees`: the local node and RPC, every indexed server, then Kyoto.
+- `broadcast`: the local node, then one enabled RPC endpoint, then Kyoto; only when neither is on, the history servers.
+- `check`: every Electrum/Esplora server, asked for tips and headers only.
+
+RPC probes check the genesis hash, tip and block-filter availability. Only one RPC endpoint may
+be enabled per network. RPC credentials use the same restricted storage and read API as Esplora.
 
 Plus `proxy`, `peers` (Kyoto's peers, below), `crossCheck` (two operators among
 chain and check) and `unrouted` (enabled sources left out, and why: no proxy, suspect, wrong

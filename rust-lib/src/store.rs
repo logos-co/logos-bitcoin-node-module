@@ -147,6 +147,13 @@ impl Store {
         if let Err(e) = store.validate() {
             return Loaded::Corrupt(e);
         }
+        // Catalog addition only: preserve every configured endpoint, credential and route.
+        if let Some(cfg) = store.networks.get_mut(&BNetwork::Mainnet) {
+            let preset = sources::defaults(BNetwork::Mainnet).into_iter().find(|s| s.id == "publicnode-rpc").expect("built-in RPC");
+            if !cfg.sources.iter().any(|s| s.id == preset.id || s.url.trim_end_matches('/') == preset.url) {
+                cfg.sources.push(preset);
+            }
+        }
         if store.salt.len() != 32 || !store.salt.bytes().all(|b| b.is_ascii_hexdigit()) {
             store.salt = fresh_salt();
         }
@@ -216,6 +223,35 @@ mod tests {
             s.networks.insert(net, NetConfig::seeded(net));
         }
         s
+    }
+
+    #[test]
+    fn publicnode_migration_is_disabled_and_preserves_custom_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let mut old = configured();
+        let main = old.networks.get_mut(&BNetwork::Mainnet).unwrap();
+        main.sources.retain(|s| s.id != "publicnode-rpc");
+        main.sources[2].credentials = Some(Credentials { username: "user".into(), password: "pass".into() });
+        main.sources[2].tor = false;
+        let previous = main.sources.clone();
+        old.save(&path).unwrap();
+        let Loaded::Found(mut updated) = Store::load(&path) else { panic!() };
+        let sources = &updated.networks[&BNetwork::Mainnet].sources;
+        assert_eq!(&sources[..previous.len()], &previous);
+        let rpc = sources.last().unwrap();
+        assert_eq!(rpc.id, "publicnode-rpc");
+        assert!(!rpc.enabled && !rpc.history && !rpc.tor);
+        assert!(updated.networks[&BNetwork::Signet].sources.iter().all(|s| s.id != "publicnode-rpc"));
+        updated.save(&path).unwrap();
+        let Loaded::Found(again) = Store::load(&path) else { panic!() };
+        assert_eq!(again, updated);
+        // Someone already entered this URL: retain their name, credentials and Tor choice.
+        let rpc = updated.networks.get_mut(&BNetwork::Mainnet).unwrap().sources.last_mut().unwrap();
+        rpc.id = "my-publicnode".into(); rpc.tor = true; rpc.enabled = true;
+        updated.save(&path).unwrap();
+        let Loaded::Found(again) = Store::load(&path) else { panic!() };
+        assert_eq!(again, updated);
     }
 
     #[test]

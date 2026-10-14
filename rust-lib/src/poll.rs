@@ -235,6 +235,7 @@ pub async fn probe(t: &Target, iso: &Isolation, check_genesis: bool) -> Health {
     let attempt = async {
         match t.kind {
             Kind::Electrum => electrum::probe(&t.url, t.route, proxy.as_ref(), iso, pin).await,
+            Kind::Rpc => crate::net::rpc::probe(&t.url, creds, t.route, proxy.as_ref(), iso, pin).await,
             Kind::Esplora => esplora::probe(&t.url, creds, t.route, proxy.as_ref(), iso, check_genesis, pin).await,
             Kind::Kyoto | Kind::Local => (Err("not probed by this module".into()), None),
         }
