@@ -15,7 +15,8 @@ use crate::sources::{self, Kind, Source};
 use crate::strnum::{de, de_opt, double_option, ser, ser_opt};
 
 pub const FILE_NAME: &str = "bitcoin_sources.json";
-pub const VERSION: u32 = 1;
+/// 2: the proxy may be `tor`, the Tor that comes with Logos, the new default.
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -112,6 +113,15 @@ impl Store {
         Self { version: VERSION, proxy: None, salt: fresh_salt(), networks: BTreeMap::new() }
     }
 
+    /// Version 1's default, a Tor the user had to run, becomes the Tor that comes with Logos,
+    /// once: the file keeps version 1 until the next save, so an older build still reads it.
+    fn upgrade(&mut self) {
+        if self.version == 1 && self.proxy() == Some(proxy::OLD_DEFAULT_PROXY) {
+            self.proxy = Some(Some(proxy::BUILT_IN.into()));
+        }
+        self.version = VERSION;
+    }
+
     pub fn proxy(&self) -> Option<&str> {
         self.proxy.as_ref().and_then(|p| p.as_deref())
     }
@@ -139,9 +149,10 @@ impl Store {
             Ok(s) => s,
             Err(e) => return Loaded::Corrupt(e.to_string()),
         };
-        if store.version != VERSION {
+        if !(1..=VERSION).contains(&store.version) {
             return Loaded::Corrupt(format!("unknown version {}", store.version));
         }
+        store.upgrade();
         let kept = networks();
         store.networks.retain(|net, _| kept.contains(net));
         if let Err(e) = store.validate() {
@@ -294,6 +305,40 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains("\"proxy\": null"));
         let Loaded::Found(back) = Store::load(&path) else { panic!() };
         assert_eq!((back.proxy, back.salt), (Some(None), s.salt));
+    }
+
+    #[test]
+    fn version_1s_default_proxy_becomes_the_built_in_tor_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let load = || match Store::load(&path) {
+            Loaded::Found(s) => s,
+            _ => panic!("reload failed"),
+        };
+        let mut old = configured();
+        (old.version, old.proxy) = (1, Some(Some(proxy::OLD_DEFAULT_PROXY.into())));
+        old.save(&path).unwrap();
+        let up = load();
+        assert_eq!((up.version, up.proxy()), (VERSION, Some(proxy::BUILT_IN)));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"version\": 1"), "an older build can still read it until a save");
+
+        // The user's own Tor elsewhere, and a cleared proxy, stay as they were.
+        old.proxy = Some(Some("socks5h://127.0.0.1:9150".into()));
+        old.save(&path).unwrap();
+        assert_eq!(load().proxy(), Some("socks5h://127.0.0.1:9150"));
+        old.proxy = Some(None);
+        old.save(&path).unwrap();
+        assert_eq!(load().proxy, Some(None));
+
+        // Saved by this version, 9050 is the user's choice.
+        let mut chosen = configured();
+        chosen.proxy = Some(Some(proxy::OLD_DEFAULT_PROXY.into()));
+        chosen.save(&path).unwrap();
+        assert_eq!(load().proxy(), Some(proxy::OLD_DEFAULT_PROXY));
+
+        chosen.version = VERSION + 1;
+        chosen.save(&path).unwrap();
+        assert!(matches!(Store::load(&path), Loaded::Corrupt(e) if e.contains("unknown version")));
     }
 
     #[test]

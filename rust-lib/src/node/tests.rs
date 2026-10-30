@@ -32,12 +32,18 @@ fn harness() -> Harness {
     Harness { node, events, dir }
 }
 
-/// Configured with the defaults, and the events so far dropped.
+/// Configured with the defaults, the built-in Tor ready at `TOR`, and the events so far dropped.
 fn configured() -> Harness {
     let h = harness();
     assert_eq!(v(h.node.init_defaults())["ok"], true);
+    h.node.set_tor(tor_view("ready", Some(TOR)));
     h.take();
     h
+}
+
+/// The built-in Tor as tor_module would report it.
+fn tor_view(state: &str, socks: Option<&str>) -> TorView {
+    TorView { state: state.into(), progress: if state == "ready" { 100 } else { 40 }, detail: String::new(), socks: socks.map(String::from), answered: true }
 }
 
 impl Harness {
@@ -439,6 +445,7 @@ fn the_wallet_core_reports_on_kyotos_peers() {
     assert_eq!(v(h.node.report_peers("testnet3", "{}"))["error"], "network must be mainnet, testnet4 or signet");
     // Kept across a restart: records, skips and learned peers.
     let again = Node::open(Some(h.dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
+    again.set_tor(tor_view("ready", Some(TOR)));
     assert_eq!(again.route_table("signet"), h.node.route_table("signet"));
     let c = v(again.peer_list("signet"))["counts"].clone();
     assert_eq!((&c["learned"], &c["okLast30d"], &c["usable"]), (&json!(1), &json!(1), &json!(shipped.peers.len())));
@@ -673,3 +680,62 @@ fn probes_go_through_the_health_thread() {
     assert!(poller.stop(Duration::from_millis(1000)));
 }
 
+
+#[test]
+fn the_built_in_tor_is_the_default_and_routes_follow_its_socks_port() {
+    let h = harness();
+    h.node.init_defaults();
+    assert!(h.node.uses_built_in_tor());
+    assert_eq!(v(h.node.get_sources("mainnet"))["proxy"], "tor");
+    // Not heard from yet: Tor routes wait, and health says Tor is starting.
+    let rt = v(h.node.route_table("mainnet"));
+    assert_eq!((&rt["proxy"], &rt["unrouted"][0]["reason"]), (&Value::Null, &json!(TOR_STARTING)));
+    assert_eq!(v(h.node.source_health("mainnet"))["tor"], json!({"state": "connecting", "progress": 0, "detail": "", "socks": null}));
+    h.take();
+
+    // Joining, with the port listening: routes dial it already; the poller looks again when ready.
+    h.node.set_tor(tor_view("connecting", Some("socks5h://127.0.0.1:9250")));
+    assert_eq!(v(h.node.route_table("mainnet"))["proxy"], "socks5h://127.0.0.1:9250");
+    assert!(v(h.node.route_table("mainnet"))["unrouted"].as_array().unwrap().is_empty());
+    assert_eq!(h.take().iter().filter(|e| e.starts_with("routes")).count(), 3, "every network's routes changed");
+    let t = h.node.poll_plan().0;
+    assert!(t.iter().filter(|t| t.route != Route::Direct).all(|t| t.proxy.as_deref() == Some("socks5h://127.0.0.1:9250")) && !t.is_empty());
+    h.node.set_tor(tor_view("ready", Some("socks5h://127.0.0.1:9250")));
+    assert!(h.take().iter().all(|e| e.starts_with("health")), "ready changes health, not routes");
+    assert_eq!(v(h.node.source_health("signet"))["tor"]["state"], "ready");
+
+    // The port moved, as when 9250 was taken: routes follow.
+    h.node.set_tor(tor_view("ready", Some("socks5h://127.0.0.1:41234")));
+    assert_eq!(v(h.node.route_table("testnet4"))["proxy"], "socks5h://127.0.0.1:41234");
+
+    // The user turned the port off in the Tor app: fail closed, and say so.
+    h.node.set_tor(tor_view("ready", None));
+    let rt = v(h.node.route_table("mainnet"));
+    assert_eq!((&rt["proxy"], &rt["unrouted"][0]["reason"]), (&Value::Null, &json!(TOR_SOCKS_OFF)));
+    // tor_module missing.
+    h.node.set_tor(TorView::from_reply(Err("object_unavailable".into())));
+    assert_eq!(v(h.node.route_table("mainnet"))["unrouted"][0]["reason"], TOR_MISSING);
+
+    // The user's own Tor: tor_module is no longer asked, and health leaves it out.
+    h.node.set_proxy(TOR);
+    assert!(!h.node.uses_built_in_tor());
+    assert_eq!(v(h.node.route_table("mainnet"))["proxy"], TOR);
+    assert_eq!(v(h.node.source_health("mainnet"))["tor"], Value::Null);
+    assert_eq!(v(h.node.set_proxy("tor"))["proxy"], "tor");
+    assert!(h.node.uses_built_in_tor());
+}
+
+#[test]
+fn tor_modules_status_reply() {
+    let ok = |s: &str| TorView::from_reply(Ok(s.into()));
+    let ready = ok(r#"{"ok":true,"state":"ready","progress":100,"detail":"x","socks":"socks5h://127.0.0.1:9250"}"#);
+    assert_eq!(ready, tor_view("ready", Some("socks5h://127.0.0.1:9250")));
+    let idle = ok(r#"{"ok":true,"state":"idle","progress":0,"socks":null}"#);
+    assert_eq!((idle.state.as_str(), idle.socks, idle.answered), ("connecting", None, true));
+    let blocked = ok(r#"{"ok":true,"state":"blocked","progress":40,"detail":"no network","socks":"socks5h://127.0.0.1:9250"}"#);
+    assert_eq!((blocked.detail.as_str(), blocked.progress), ("no network", 40));
+    assert_eq!(ok(r#"{"ok":false,"error":"starting"}"#), TorView { state: "connecting".into(), progress: 0, detail: String::new(), socks: None, answered: false });
+    let missing = TorView::from_reply(Err("object_unavailable".into()));
+    assert_eq!((missing.state.as_str(), missing.answered), ("failed", false));
+    assert_eq!(ok(r#"{"ok":true,"state":"ready","socks":"socks5://127.0.0.1:9250"}"#).socks, None, "never a port that resolves names locally");
+}

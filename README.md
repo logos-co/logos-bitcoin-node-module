@@ -1,7 +1,8 @@
 # logos-bitcoin-node-module
 
 `bitcoin_node_module`: the sources a Bitcoin wallet uses, per network. It keeps each
-network's source list and one Tor proxy, answers a route table per role, keeps a book of Kyoto's
+network's source list and one Tor setting (the Tor that comes with Logos, or your own SOCKS
+proxy), answers a route table per role, keeps a book of Kyoto's
 peers, and probes every enabled server's health with address-free calls. It holds no keys and
 carries no wallet traffic.
 
@@ -28,8 +29,8 @@ the route are computed. Kinds:
 - A server on your own network is reached directly: loopback, private, CGNAT, link-local and
   IPv6 unique-local addresses, and `.local`, `.lan`, `.home.arpa` and `.internal` names that
   resolve only to such addresses. The rules are the Zcash node module's `net/client.rs`.
-- Without a proxy, a source routed through Tor has no route. It never falls back to a direct
-  connection.
+- Without a Tor route (below), a source routed through Tor has no route. It never falls back
+  to a direct connection.
 - Operators, not hosts, count: a user-added server defaults to its registered domain
   (`you` on your network), unless the caller names one.
 - An Esplora or RPC server may take HTTP basic auth (`https://user:pw@host/api`, or `credentials`).
@@ -46,8 +47,7 @@ the route are computed. Kinds:
 
 ## Defaults
 
-`init_defaults` fills what is absent, field by field: the proxy `socks5h://127.0.0.1:9050`,
-and per network Kyoto on, one server for fee rates only (history off), and every other source
+`init_defaults` fills what is absent, field by field: the proxy `tor` (below), and per network Kyoto on, one server for fee rates only (history off), and every other source
 off. Sources are switched on one by one. PublicNode RPC is disabled and direct by default.
 Existing mainnet configurations gain this disabled catalog entry on load, preserving existing
 settings and avoiding a duplicate when the endpoint was already added manually.
@@ -75,6 +75,21 @@ ship: the onion service on its tcp port, and stagemole.eu and c3-soft.com, whose
 web PKI trusts. The other four answer only with self-signed certificates (two of them version 1);
 pin one with `certSha256` to use it.
 
+## Tor
+
+`set_proxy` takes `tor`, a `socks5h://host:port` URL of your own Tor, or an empty string (no
+proxy). `tor` is the Tor
+that comes with Logos: tor_module (logos-tor-module), reached through the SOCKS port its
+`status()` names. While `tor` is set, a follower asks `status()` every 2 s until Tor is ready,
+then every 30 s; that call also starts Tor. Routes and probes use that port, and change when it
+does. A store from before (version 1) whose proxy was the old default, `socks5h://127.0.0.1:9050`,
+moves to `tor` once; a proxy someone chose stays. Older builds set a version 2 store aside as
+unreadable.
+
+Without a route through Tor, `unrouted` says why: no proxy is set, the built-in Tor is starting,
+its SOCKS port is off (the Tor app turns it on), or it is not available. `source_health` carries
+`tor`: `{ state, progress, detail, socks }` for the built-in Tor, null for your own.
+
 ## Routes
 
 `route_table(network)` gives one list per role, each `{ id, kind, url, operator, route }` with
@@ -92,9 +107,9 @@ pin one with `certSha256` to use it.
 RPC probes check the genesis hash, tip and block-filter availability. Only one RPC endpoint may
 be enabled per network. RPC credentials use the same restricted storage and read API as Esplora.
 
-Plus `proxy`, `peers` (Kyoto's peers, below), `crossCheck` (two operators among
-chain and check) and `unrouted` (enabled sources left out, and why: no proxy, suspect, wrong
-network). A disabled source is never routed. Entries carry `certSha256` when the source has a
+Plus `proxy` (the SOCKS URL to dial; for `tor`, tor_module's port), `peers` (Kyoto's peers,
+below), `crossCheck` (two operators among chain and check) and `unrouted` (enabled sources left
+out, and why: no Tor route, suspect, wrong network). A disabled source is never routed. Entries carry `certSha256` when the source has a
 pin, and `userAdded` for a server the person added: the wallet core speaks plain text only to
 such a server on the person's network.
 
