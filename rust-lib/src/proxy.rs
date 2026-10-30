@@ -1,9 +1,17 @@
-//! The proxy: Tor's SOCKS port, one for every source, socks5h only (socks5 resolves names
-//! locally; http proxies cannot isolate circuits). Without one, Tor routes have no route.
+//! The proxy, one for every source: `tor`, the default, is the Tor that comes with Logos
+//! (tor_module, through the SOCKS port its status() names); otherwise the user's own Tor,
+//! socks5h only (socks5 resolves names locally; http proxies cannot isolate circuits).
+//! Without one, Tor routes have no route.
 
 use crate::net::socks::ProxyAddr;
 
-pub const DEFAULT_PROXY: &str = "socks5h://127.0.0.1:9050";
+/// The Tor that comes with Logos.
+pub const BUILT_IN: &str = "tor";
+
+pub const DEFAULT_PROXY: &str = BUILT_IN;
+
+/// The default before the built-in Tor: a Tor the user had to run.
+pub const OLD_DEFAULT_PROXY: &str = "socks5h://127.0.0.1:9050";
 
 /// set_proxy's argument: an empty string clears the proxy.
 pub fn parse_setting(s: &str) -> Result<Option<String>, String> {
@@ -13,9 +21,12 @@ pub fn parse_setting(s: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Normalizes a proxy URL to `socks5h://host:port`, refusing every other scheme.
+/// Normalizes a proxy URL to `socks5h://host:port`, refusing every other scheme, or to `tor`.
 pub fn normalize(url: &str) -> Result<String, String> {
     let lower = url.trim().to_ascii_lowercase();
+    if lower == BUILT_IN {
+        return Ok(lower);
+    }
     if lower.starts_with("socks5://") || lower.starts_with("socks4") || lower.starts_with("socks://") {
         return Err("socks5:// resolves names locally; use socks5h://host:port".into());
     }
@@ -46,6 +57,7 @@ mod tests {
         assert_eq!(normalize("socks5h://127.0.0.1:9050").unwrap(), "socks5h://127.0.0.1:9050");
         assert_eq!(normalize(" SOCKS5H://Tor.Local:9150/ ").unwrap(), "socks5h://tor.local:9150");
         assert_eq!(normalize("socks5h://[::1]:9050").unwrap(), "socks5h://[::1]:9050");
+        assert_eq!(normalize(" TOR ").unwrap(), BUILT_IN);
         for (url, why) in [
             ("socks5://127.0.0.1:9050", "resolves names locally"),
             ("socks4a://127.0.0.1:9050", "resolves names locally"),
@@ -69,6 +81,7 @@ mod tests {
     fn empty_clears() {
         assert_eq!(parse_setting("  ").unwrap(), None);
         assert_eq!(parse_setting("socks5h://127.0.0.1:19050").unwrap().as_deref(), Some("socks5h://127.0.0.1:19050"));
+        assert_eq!(parse_setting("tor").unwrap().as_deref(), Some(BUILT_IN));
         assert!(parse_setting("direct").is_err());
     }
 }

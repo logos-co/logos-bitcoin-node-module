@@ -15,12 +15,15 @@ use crate::net::client::{is_lan_host, route_for, Route};
 use crate::net::p2p::Gossip;
 use crate::network::{bad_network, networks, BNetwork};
 use crate::peers::{self, peer_host};
-use crate::proxy::{self, DEFAULT_PROXY};
+use crate::proxy::{self, BUILT_IN, DEFAULT_PROXY};
 use crate::reply;
 use crate::sources::{self, Changes, Credentials, Kind, Source, LOCAL_ID};
 use crate::store::{NetConfig, Store, Suspicion};
 
 pub const NO_PROXY: &str = "no proxy is set";
+pub const TOR_STARTING: &str = "the Tor that comes with Logos is starting";
+pub const TOR_SOCKS_OFF: &str = "Tor's SOCKS port is off: turn it on in the Tor app";
+pub const TOR_MISSING: &str = "the Tor that comes with Logos is not available";
 pub const LOCKED: &str = "Close the wallet to change these settings.";
 pub const SUSPECT: &str = "suspect";
 /// How long probe waits on the network, inside the 20 s IPC deadline.
@@ -62,6 +65,48 @@ pub struct Harvest {
     pub proxy: Option<String>,
 }
 
+/// The built-in Tor as tor_module last reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorView {
+    /// connecting, ready, blocked or failed.
+    pub state: String,
+    pub progress: u8,
+    /// Why it is blocked or failed; empty otherwise, so progress alone does not churn events.
+    pub detail: String,
+    /// Its SOCKS port, `socks5h://IP:PORT`, which Tor routes dial; none while the user has it off.
+    pub socks: Option<String>,
+    /// tor_module answered; false when it is not loaded or did not answer.
+    pub answered: bool,
+}
+
+impl TorView {
+    /// tor_module's status() reply, or why there was none.
+    pub fn from_reply(reply: Result<String, String>) -> Self {
+        let failed = |detail: String| Self { state: "failed".into(), progress: 0, detail, socks: None, answered: false };
+        let v: Value = match reply.and_then(|t| serde_json::from_str(&t).map_err(|e| format!("tor_module: {e}"))) {
+            Ok(v) => v,
+            Err(e) => return failed(e),
+        };
+        match v["error"].as_str() {
+            _ if v["ok"] == true => {}
+            Some("starting") => return Self { state: "connecting".into(), progress: 0, detail: String::new(), socks: None, answered: false },
+            e => return failed(e.unwrap_or("tor_module answered without ok").into()),
+        }
+        // Asking starts an idle Tor, so idle is only ever a moment's answer.
+        let state = match v["state"].as_str() {
+            None | Some("idle") => "connecting".to_string(),
+            Some(s) => s.to_string(),
+        };
+        let detail = match state.as_str() {
+            "blocked" | "failed" => v["detail"].as_str().unwrap_or("").to_string(),
+            _ => String::new(),
+        };
+        let progress = v["progress"].as_u64().unwrap_or(0).min(100) as u8;
+        let socks = v["socks"].as_str().and_then(|s| proxy::normalize(s).ok()).filter(|s| s != BUILT_IN);
+        Self { state, progress, detail, socks, answered: true }
+    }
+}
+
 /// bitcoind_module's status, when it is loaded. A trait so the pure tests can stand one in.
 pub trait LocalStatus: Send + Sync {
     fn status(&self) -> Result<Value, String>;
@@ -89,6 +134,8 @@ struct Inner {
     dir: Option<PathBuf>,
     /// Regtest's fixed seeds: a test-only setting from regtest.json.
     regtest_seeds: Vec<String>,
+    /// The built-in Tor, once tor_module has been asked.
+    tor: Option<TorView>,
 }
 
 pub fn now() -> u64 {
@@ -133,10 +180,40 @@ impl Inner {
         }
     }
 
+    /// Where Tor routes dial: the user's own Tor, or the built-in one's SOCKS port while it has one.
+    fn dial_proxy(&self) -> Option<&str> {
+        match self.store.proxy() {
+            Some(BUILT_IN) => self.tor.as_ref().and_then(|t| t.socks.as_deref()),
+            p => p,
+        }
+    }
+
+    /// Why Tor routes have nowhere to dial.
+    fn no_proxy(&self) -> &'static str {
+        match (self.store.proxy(), &self.tor) {
+            (Some(BUILT_IN), None) => TOR_STARTING,
+            (Some(BUILT_IN), Some(t)) if t.answered => TOR_SOCKS_OFF,
+            (Some(BUILT_IN), Some(t)) if t.state == "connecting" => TOR_STARTING,
+            (Some(BUILT_IN), Some(_)) => TOR_MISSING,
+            _ => NO_PROXY,
+        }
+    }
+
+    /// The built-in Tor for health, while the proxy is it.
+    fn tor_value(&self) -> Value {
+        if self.store.proxy() != Some(BUILT_IN) {
+            return Value::Null;
+        }
+        match &self.tor {
+            Some(t) => json!({"state": t.state, "progress": t.progress, "detail": t.detail, "socks": t.socks, "answered": t.answered}),
+            None => json!({"state": "connecting", "progress": 0, "detail": "", "socks": null, "answered": false}),
+        }
+    }
+
     /// Fail closed: a source whose route goes through Tor has none without the proxy.
     fn blocked(&self, cfg: &NetConfig, s: &Source) -> Option<&'static str> {
         let tor = matches!(Self::route_of(cfg, s), Route::Tor | Route::Onion);
-        (tor && self.store.proxy().is_none()).then_some(NO_PROXY)
+        (tor && self.dial_proxy().is_none()).then(|| self.no_proxy())
     }
 
     /// Why a source gets no route, if it gets none.
@@ -168,7 +245,7 @@ impl Inner {
 
     fn target(&self, net: BNetwork, cfg: &NetConfig, s: &Source) -> Target {
         let route = Self::route_of(cfg, s);
-        let proxy = matches!(route, Route::Tor | Route::Onion).then(|| self.store.proxy().map(String::from)).flatten();
+        let proxy = matches!(route, Route::Tor | Route::Onion).then(|| self.dial_proxy().map(String::from)).flatten();
         Target {
             network: net,
             id: s.id.clone(),
@@ -230,7 +307,7 @@ impl Inner {
             .collect();
         reply::ok(json!({
             "network": net.name(),
-            "proxy": self.store.proxy(),
+            "proxy": self.dial_proxy(),
             "chain": r.chain,
             "history": r.history,
             "pending": r.pending,
@@ -340,6 +417,7 @@ impl Inner {
             "overall": health::overall(&rows),
             "pending": measured.iter().any(|(s, h, _)| s.enabled && h.is_none()),
             "sources": list,
+            "tor": self.tor_value(),
         })
     }
 
@@ -410,6 +488,7 @@ impl Node {
             books: BTreeMap::new(),
             dir,
             regtest_seeds: vec![],
+            tor: None,
         };
         for net in networks() {
             inner.load_book(net);
@@ -479,7 +558,7 @@ impl Node {
     pub fn harvest_plan(&self) -> Vec<Harvest> {
         let mut inner = self.lock();
         let now = now();
-        let proxy = inner.store.proxy().map(String::from);
+        let proxy = inner.dial_proxy().map(String::from);
         let mut out = Vec::new();
         for net in networks() {
             let Some(cfg) = inner.cfg(net) else { continue };
@@ -530,6 +609,33 @@ impl Node {
         };
         self.emit(events);
         learning
+    }
+
+    /// Whether the proxy is the built-in Tor: only then is tor_module asked, and asking is what
+    /// starts it.
+    pub fn uses_built_in_tor(&self) -> bool {
+        self.lock().store.proxy() == Some(BUILT_IN)
+    }
+
+    /// tor_module's latest status. Routes follow its SOCKS port and health shows it. The poller
+    /// looks again once Tor is ready, and when the port appears: probes made meanwhile failed.
+    pub fn set_tor(&self, view: TorView) {
+        let (events, look_again) = {
+            let mut inner = self.lock();
+            if inner.tor.as_ref() == Some(&view) {
+                return;
+            }
+            let old = inner.tor.replace(view.clone());
+            let ready = |t: &Option<TorView>| t.as_ref().is_some_and(|t| t.state == "ready");
+            let socks = |t: &Option<TorView>| t.as_ref().and_then(|t| t.socks.clone());
+            let look_again = (!ready(&old) && view.state == "ready") || socks(&old) != view.socks;
+            let events: Vec<Event> = networks().into_iter().flat_map(|net| inner.changes(net)).collect();
+            (events, look_again)
+        };
+        self.emit(events);
+        if look_again {
+            self.wake.notify_one();
+        }
     }
 
     /// Notified when sources or the proxy change, so the poller looks at once.
