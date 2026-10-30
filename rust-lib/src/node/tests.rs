@@ -690,7 +690,7 @@ fn the_built_in_tor_is_the_default_and_routes_follow_its_socks_port() {
     // Not heard from yet: Tor routes wait, and health says Tor is starting.
     let rt = v(h.node.route_table("mainnet"));
     assert_eq!((&rt["proxy"], &rt["unrouted"][0]["reason"]), (&Value::Null, &json!(TOR_STARTING)));
-    assert_eq!(v(h.node.source_health("mainnet"))["tor"], json!({"state": "connecting", "progress": 0, "detail": "", "socks": null}));
+    assert_eq!(v(h.node.source_health("mainnet"))["tor"], json!({"state": "connecting", "progress": 0, "detail": "", "socks": null, "answered": false}));
     h.take();
 
     // Joining, with the port listening: routes dial it already; the poller looks again when ready.
@@ -710,6 +710,7 @@ fn the_built_in_tor_is_the_default_and_routes_follow_its_socks_port() {
 
     // The user turned the port off in the Tor app: fail closed, and say so.
     h.node.set_tor(tor_view("ready", None));
+    assert_eq!(v(h.node.source_health("signet"))["tor"]["answered"], true, "answered, and the port is off");
     let rt = v(h.node.route_table("mainnet"));
     assert_eq!((&rt["proxy"], &rt["unrouted"][0]["reason"]), (&Value::Null, &json!(TOR_SOCKS_OFF)));
     // tor_module missing.

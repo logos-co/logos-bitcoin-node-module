@@ -88,7 +88,8 @@ unreadable.
 
 Without a route through Tor, `unrouted` says why: no proxy is set, the built-in Tor is starting,
 its SOCKS port is off (the Tor app turns it on), or it is not available. `source_health` carries
-`tor`: `{ state, progress, detail, socks }` for the built-in Tor, null for your own.
+`tor`: `{ state, progress, detail, socks, answered }` for the built-in Tor, null for your own.
+`socks` is null while its SOCKS port is off, and `answered` false until tor_module answers.
 
 ## Routes
 

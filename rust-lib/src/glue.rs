@@ -65,8 +65,8 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     fn report_peers(&self, network: String, report_json: String) -> String;
     /// `{ ok, network, overall, pending, sources: [{ id, kind, state, tipHeight, tipHash, rttMs,
     /// route, checkedAt, error, serverVersion, suspect, certificate?, ... }], tor }` from address-free
-    /// calls only. `tor` is the built-in Tor's `{ state, progress, detail, socks }` while the proxy
-    /// is it, else null. A TLS server's `certificate` is `{ certSha256, subject, issuer, notBefore,
+    /// calls only. `tor` is the built-in Tor's `{ state, progress, detail, socks, answered }` while
+    /// the proxy is it, else null; `answered` is false until tor_module answers. A TLS server's `certificate` is `{ certSha256, subject, issuer, notBefore,
     /// notAfter, trusted }`, also when untrusted, for the app to offer pinning it.
     fn source_health(&self, network: String) -> String;
     /// Probes `source_id` now, or every enabled server when empty, then answers as

@@ -205,8 +205,8 @@ impl Inner {
             return Value::Null;
         }
         match &self.tor {
-            Some(t) => json!({"state": t.state, "progress": t.progress, "detail": t.detail, "socks": t.socks}),
-            None => json!({"state": "connecting", "progress": 0, "detail": "", "socks": null}),
+            Some(t) => json!({"state": t.state, "progress": t.progress, "detail": t.detail, "socks": t.socks, "answered": t.answered}),
+            None => json!({"state": "connecting", "progress": 0, "detail": "", "socks": null, "answered": false}),
         }
     }
 
