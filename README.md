@@ -163,7 +163,8 @@ or LAN seeds, reached directly: `{ "harvestSeeds": ["127.0.0.1:18444"] }`.
 The health thread probes every enabled server once a minute, four at a time, on one Tor
 circuit per server: Electrum `server.version`, `server.features` (the genesis block) and
 `blockchain.headers.subscribe`; Esplora `/blocks/tip/height`, `/blocks/tip/hash`, and
-`/block-height/0` once per circuit. A server on another network is never routed. `probe`
+`/block-height/0` once per circuit. A server that does not answer gets a new circuit next round,
+so a stuck onion connection does not hold its later probes. A server on another network is never routed. `probe`
 asks now and answers within 15 s. A TLS server's row carries `certificate`: `{ certSha256,
 subject, issuer, notBefore, notAfter, trusted }`, read in a handshake that proves the server
 holds the key. An untrusted one (a self-signed server, or a pin that no longer matches) is

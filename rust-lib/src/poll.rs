@@ -179,11 +179,28 @@ async fn ask(seed: &str, route: Route, proxy: Option<&ProxyAddr>, net: BNetwork)
     peer.getaddr(GETADDR_WINDOW).await
 }
 
-/// The circuit of one server for the session: fixed SOCKS credentials, and whether its
+/// The circuit of one server: fixed SOCKS credentials while it answers, and whether its
 /// genesis block was checked on it (Esplora asks once; Electrum's features carry it).
 struct Circuit {
     isolation: Isolation,
     genesis_ok: bool,
+}
+
+impl Circuit {
+    fn new() -> Self {
+        Self { isolation: Isolation::fresh(), genesis_ok: false }
+    }
+
+    /// A server that did not answer gets new credentials: Tor would queue the next probe behind
+    /// a stuck onion connection on the old ones (measured: four rounds, while new ones got in).
+    fn after(&mut self, state: State, checked: bool) {
+        match state {
+            State::Ok if checked => self.genesis_ok = true,
+            State::WrongNetwork => self.genesis_ok = false,
+            State::Unreachable => *self = Self::new(),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Default)]
@@ -200,7 +217,7 @@ async fn cycle(node: &Node, prober: &mut Prober) {
     let jobs: Vec<(Target, Isolation, bool)> = targets
         .into_iter()
         .map(|t| {
-            let c = prober.circuits.entry(t.clone()).or_insert_with(|| Circuit { isolation: Isolation::fresh(), genesis_ok: false });
+            let c = prober.circuits.entry(t.clone()).or_insert_with(Circuit::new);
             let (iso, check) = (c.isolation.clone(), !c.genesis_ok);
             (t, iso, check)
         })
@@ -213,11 +230,7 @@ async fn cycle(node: &Node, prober: &mut Prober) {
         .buffer_unordered(MAX_CONCURRENT);
     while let Some((t, h, checked)) = results.next().await {
         if let Some(c) = prober.circuits.get_mut(&t) {
-            c.genesis_ok = match h.state {
-                State::Ok if checked => true,
-                State::WrongNetwork => false,
-                _ => c.genesis_ok,
-            };
+            c.after(h.state, checked);
         }
         node.record(&t, h);
     }
@@ -311,6 +324,16 @@ mod tests {
             let c = unpinned.certificate.expect("shown for Trust this certificate?");
             assert_eq!((unpinned.state, c.trusted), (State::Unreachable, false));
         }
+    }
+
+    #[test]
+    fn a_server_that_did_not_answer_gets_a_new_circuit() {
+        let mut c = Circuit::new();
+        let first = c.isolation.clone();
+        c.after(State::Ok, true);
+        assert_eq!((&c.isolation, c.genesis_ok), (&first, true), "kept while it answers");
+        c.after(State::Unreachable, false);
+        assert!(c.isolation != first && !c.genesis_ok, "new credentials, genesis asked again");
     }
 
     #[test]
