@@ -144,20 +144,18 @@ such a server on the person's network.
 
 The curated list per network is `rust-lib/peer-lists/<network>.json`, written at release time
 by the crawler (logos-bitcoin-peer-list, `peer-list release`): format 1, a `version`, when it
-was signed (`created`), the day of its last run (`date`), a note, onion v3 peers as
-`host:port`, a key id, and an Ed25519 signature over `logos-bitcoin-peer-list/1\n` followed by
-the list as compact JSON in field order with `signature` null (`refreshUrl` stays in the format,
-null). A list is used only if its signature checks against a key compiled into this build
-(`rust-lib/keys/`): today that is the crawler's **TEST key**, and the release key is not chosen
-yet. A shipped list that fails is replaced by an empty one that says why. The shipped lists are
-**provisional**: each note says how many runs it comes from. Nothing is fetched: a newer list
-comes with a newer build.
+was built (`created`), the day of its last run (`date`), a note, `refreshUrl` (null), and onion
+v3 peers as `host:port`. The lists are not signed: they are compiled in (`include_str!`), nothing
+fetches them, and Jenkins signs the package. A list fetched at runtime would need a signature
+again. Each shipped list is checked when first used (format, network, well-formed public or
+onion peers, dates); one that fails is replaced by an empty one that says why. The shipped lists
+are **provisional**: each note says how many runs it comes from. A newer list comes with a newer
+build.
 
 The clearnet list, `rust-lib/peer-lists/clearnet-<network>.json` (`peer-list release
---clearnet`), has the same fields and key, with `peers: [{ peer, services }]` (public IPv4 and
-IPv6 addresses, at most 2 per /16 or /32, services as a decimal string: bit 11 means BIP324)
-and its own tag, `logos-bitcoin-clearnet-peers/1\n`. Until the crawler's first clearnet release
-run, each ships as an unsigned, empty placeholder.
+--clearnet`), has the same fields, with `peers: [{ peer, services }]` (public IPv4 and IPv6
+addresses, at most 2 per /16 or /32, services as a decimal string: bit 11 means BIP324). Until
+the crawler's first clearnet release run, each ships as an empty placeholder.
 
 Each install keeps its own book per network, `kyoto_peers_<network>.json` in the persistence
 directory (atomic, owner-only): entries `{ addr, port, services, source: list|learned|seed,
@@ -182,7 +180,7 @@ under the same rules plus at most 2 entries per /16 or /32.
   skipped. Your own peers (`set_own_peers`) replace the book, as `source: "own"`. Kyoto has one
   connection type for every peer, so your network's peers and peers through Tor don't mix, and
   an onion peer needs Tor.
-- `peer_list(network)`: the signed list, own peers, `usable` (as `peers`), `counts: { list,
+- `peer_list(network)`: the shipped list, own peers, `usable` (as `peers`), `counts: { list,
   learned, seed, usable, okLast30d }`, `torUse`, and `clearnet: { list, usable, counts }`
   (null on regtest).
 

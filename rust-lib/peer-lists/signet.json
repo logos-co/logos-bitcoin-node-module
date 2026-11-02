@@ -4,7 +4,7 @@
   "version": "202610110405",
   "created": "2026-10-11T04:05:49Z",
   "date": "2026-10-11",
-  "note": "PROVISIONAL: from 1 run (2026-10-11), not the plan's 6 of 7 days. Onion v3 peers serving BIP157 filters that passed every check over Tor, checked against our own Core node's filter headers. Signed with a TEST key: not a release.",
+  "note": "PROVISIONAL: from 1 run (2026-10-11), not the plan's 6 of 7 days. Onion v3 peers serving BIP157 filters that passed every check over Tor, checked against our own Core node's filter headers.",
   "refreshUrl": null,
   "peers": [
     "3qeedpzgciv65tdy2tsdmjxswhyep4aj65jtboznf5nnwcyo2lbmiyqd.onion:38333",
@@ -18,7 +18,5 @@
     "rkpn6spq25pgj24vo7hiplnafiev4uyxfh3iapzfqqqj6fpiz6dyfmad.onion:38333",
     "w7d4rwjt5igozi5v7z2m3in2wm3zsf2lhsizqqohkyrokbbie5equoad.onion:38333",
     "y263ntblu7ew5a6ujw2kbqma5fv6fk4s34hqc6k2r3elhhkb73bjvjad.onion:38333"
-  ],
-  "keyId": "test-d680f3cac9837bf9",
-  "signature": "2e1f6025ca82432e98acb0cb4004dd848dc27a31792c1035108c52d734db0e4fafefe1d7db1d3034d8a02ab5e77ac3a5478ca8eef0290c752ba0031829890f0c"
+  ]
 }

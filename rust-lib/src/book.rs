@@ -1,5 +1,5 @@
 //! Kyoto's peer books, two per network: onion peers, and clearnet peers for when Kyoto takes the
-//! chain directly. Each holds its signed list, Bitcoin Core's fixed seeds and peers learned from
+//! chain directly. Each holds its shipped list, Bitcoin Core's fixed seeds and peers learned from
 //! gossip, each with its record of successes and failures. The wallet core reports what it saw
 //! with `report_peers`; the books decide which peers Kyoto is given.
 
@@ -43,7 +43,7 @@ pub const FROM_LIST: &str = "list";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
-    /// The signed list this build ships.
+    /// The list this build ships.
     List,
     /// Gossip: reported by the wallet core, or harvested from a fixed seed.
     Learned,
