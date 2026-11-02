@@ -1,6 +1,7 @@
-//! Kyoto's peer book, one per network: the signed list, Bitcoin Core's fixed seeds and peers
-//! learned from gossip, each with its record of successes and failures. The wallet core
-//! reports what it saw with `report_peers`; the book decides which peers Kyoto is given.
+//! Kyoto's peer books, two per network: onion peers, and clearnet peers for when Kyoto takes the
+//! chain directly. Each holds its signed list, Bitcoin Core's fixed seeds and peers learned from
+//! gossip, each with its record of successes and failures. The wallet core reports what it saw
+//! with `report_peers`; the books decide which peers Kyoto is given.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -12,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::net::client::{is_lan_ip, is_onion};
 use crate::net::p2p::{onion_key, X49};
 use crate::network::BNetwork;
-use crate::peers::{normalize_peer, peer_host};
+use crate::peers::{netgroup, normalize_peer, peer_host, public_ip, PER_NETGROUP};
 use crate::strnum;
 
 pub const FORMAT: u32 = 1;
@@ -189,6 +190,10 @@ pub struct Book {
     #[serde(default, serialize_with = "strnum::ser_vec", deserialize_with = "strnum::de_vec")]
     pub harvest_tries: Vec<u64>,
     pub entries: Vec<Entry>,
+    /// The clearnet book: public IPv4 and IPv6 peers, at most 2 per /16 or /32. Left out of the
+    /// onion book's file, which an older build still reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clearnet: bool,
 }
 
 /// Gossip the book keeps: fresh, with the services Kyoto needs.
@@ -204,11 +209,31 @@ fn fresh(services: u64, seen_at: u64, now: u64) -> Result<(), &'static str> {
 
 impl Book {
     pub fn new(net: BNetwork) -> Self {
-        Book { format: FORMAT, network: net, list_version: 0, harvested_at: None, harvest_answered: false, harvest_tries: vec![], entries: vec![] }
+        Book { format: FORMAT, network: net, list_version: 0, harvested_at: None, harvest_answered: false, harvest_tries: vec![], entries: vec![], clearnet: false }
+    }
+
+    pub fn new_clearnet(net: BNetwork) -> Self {
+        Book { clearnet: true, ..Self::new(net) }
     }
 
     pub fn file_name(net: BNetwork) -> String {
         format!("kyoto_peers_{}.json", net.name())
+    }
+
+    pub fn clearnet_file_name(net: BNetwork) -> String {
+        format!("kyoto_clearnet_peers_{}.json", net.name())
+    }
+
+    fn own_file_name(&self) -> String {
+        if self.clearnet { Self::clearnet_file_name(self.network) } else { Self::file_name(self.network) }
+    }
+
+    /// A clearnet host the book may hold: public, in a netgroup with room left.
+    fn clearnet_room(&self, host: &str, port: u16) -> Result<(), &'static str> {
+        let ip = host.parse::<IpAddr>().ok().filter(|ip| public_ip(*ip)).ok_or("not a public IP address")?;
+        let group = netgroup(ip);
+        let full = self.entries.iter().filter(|e| e.source != Origin::Seed && !(e.addr == host && e.port == port)).filter(|e| e.addr.parse::<IpAddr>().is_ok_and(|a| netgroup(a) == group)).count() >= PER_NETGROUP;
+        if full { Err("its netgroup already has 2 peers") } else { Ok(()) }
     }
 
     fn index(&self) -> HashMap<(String, u16), usize> {
@@ -225,8 +250,16 @@ impl Book {
     /// kept. A list peer the new list drops stays as learned (`from: "list"`) if it worked here
     /// in 30 days, and goes otherwise; dropped seeds go. Learned entries stay as they are.
     pub fn sync_shipped(&mut self, list: &[String], list_version: u64, seeds: &[String], now: u64) {
+        let list: Vec<(String, u64)> = list.iter().map(|p| (p.clone(), X49)).collect();
+        self.sync_listed(&list, list_version, seeds, now);
+    }
+
+    /// `sync_shipped` with each list peer's services, which the clearnet list carries: a list
+    /// peer's entry takes them, so Kyoto knows which offer BIP324.
+    pub fn sync_listed(&mut self, listed: &[(String, u64)], list_version: u64, seeds: &[String], now: u64) {
         let split = |p: &String| p.rsplit_once(':').and_then(|(h, port)| Some((h.trim_start_matches('[').trim_end_matches(']').to_string(), port.parse::<u16>().ok()?)));
-        let list: HashSet<(String, u16)> = list.iter().filter_map(split).collect();
+        let services: HashMap<(String, u16), u64> = listed.iter().filter_map(|(p, s)| Some((split(p)?, *s))).collect();
+        let list: HashSet<(String, u16)> = services.keys().cloned().collect();
         let seeds: HashSet<(String, u16)> = seeds.iter().filter_map(split).filter(|k| !list.contains(k)).collect();
         let since = now.saturating_sub(OK_WITHIN);
         for e in self.entries.iter_mut().filter(|e| e.source == Origin::List && e.ok_since(since)) {
@@ -241,10 +274,11 @@ impl Book {
             Origin::Learned => true,
         });
         let index = self.index();
-        for (keys, source, services) in [(&list, Origin::List, X49), (&seeds, Origin::Seed, 0)] {
+        for (keys, source) in [(&list, Origin::List), (&seeds, Origin::Seed)] {
             let mut keys: Vec<&(String, u16)> = keys.iter().collect();
             keys.sort();
             for k in keys {
+                let svc = if source == Origin::List { services[k] } else { 0 };
                 match index.get(k) {
                     // A learned peer the shipped list now names becomes a list peer.
                     Some(&i) if self.entries[i].source == Origin::Learned && source == Origin::List => {
@@ -252,7 +286,10 @@ impl Book {
                         self.entries[i].from = None;
                     }
                     Some(_) => {}
-                    None => self.entries.push(Entry::new(&k.0, k.1, services, source, None, now, now)),
+                    None => self.entries.push(Entry::new(&k.0, k.1, svc, source, None, now, now)),
+                }
+                if let (true, Origin::List, Some(&i)) = (self.clearnet, source, index.get(k)) {
+                    self.entries[i].services = svc;
                 }
             }
         }
@@ -302,12 +339,17 @@ impl Book {
         Ok(true)
     }
 
-    /// A peer the wallet core learned: onion v3 on public networks, your network on regtest,
-    /// bits 0, 3 and 6, seen within 3 days, from a peer named as Kyoto names them.
+    /// A peer the wallet core learned: onion v3 on public networks (a public IP address in the
+    /// clearnet book, 2 per netgroup), your network on regtest, bits 0, 3 and 6, seen within 3
+    /// days, from a peer named as Kyoto names them.
     pub fn learn(&mut self, l: &Learned, now: u64) -> Result<bool, &'static str> {
         let net = self.network;
         let host_ok = match net {
             BNetwork::Regtest => l.addr.parse::<IpAddr>().is_ok_and(is_lan_ip),
+            _ if self.clearnet => {
+                self.clearnet_room(&l.addr, l.port)?;
+                true
+            }
             _ => onion_key(&l.addr).is_some(),
         };
         if !host_ok {
@@ -323,10 +365,16 @@ impl Book {
         self.add_learned(&l.addr, l.port, l.services, l.seen_at, &l.from, now)
     }
 
-    /// Gossip from a fixed seed: onion v3 only, bits 0, 3 and 6, seen within 3 days.
+    /// Gossip from a fixed seed: onion v3 only (public IP in the clearnet book), bits 0, 3 and 6,
+    /// seen within 3 days.
     pub fn harvested(&mut self, host: &str, port: u16, services: u64, seen_at: u64, seed: &str, now: u64) -> Result<bool, &'static str> {
-        if onion_key(host).is_none() || port == 0 {
+        if self.clearnet {
+            self.clearnet_room(host, port)?;
+        } else if onion_key(host).is_none() {
             return Err("not an onion v3 address");
+        }
+        if port == 0 {
+            return Err("no port");
         }
         fresh(services, seen_at, now)?;
         self.add_learned(host, port, services, seen_at, seed, now)
@@ -415,15 +463,23 @@ impl Book {
 
     /// The book in `dir`, or a new one; a file that does not parse is kept aside.
     pub fn load(dir: &Path, net: BNetwork) -> Self {
-        let path = dir.join(Self::file_name(net));
-        let Ok(text) = std::fs::read_to_string(&path) else { return Self::new(net) };
+        Self::load_kind(dir, Self::new(net))
+    }
+
+    pub fn load_clearnet(dir: &Path, net: BNetwork) -> Self {
+        Self::load_kind(dir, Self::new_clearnet(net))
+    }
+
+    fn load_kind(dir: &Path, new: Book) -> Self {
+        let path = dir.join(new.own_file_name());
+        let Ok(text) = std::fs::read_to_string(&path) else { return new };
         match serde_json::from_str::<Book>(&text) {
-            Ok(b) if b.network == net && b.format == FORMAT => b,
+            Ok(b) if b.network == new.network && b.format == FORMAT && b.clearnet == new.clearnet => b,
             other => {
-                let why = other.map(|_| "another network or format".to_string()).unwrap_or_else(|e| e.to_string());
+                let why = other.map(|_| "another network, kind or format".to_string()).unwrap_or_else(|e| e.to_string());
                 eprintln!("bitcoin_node_module: {} is unusable ({why}); starting a new peer book", path.display());
                 let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
-                Self::new(net)
+                new
             }
         }
     }
@@ -431,7 +487,7 @@ impl Book {
     /// Writes `<file>.tmp` (owner-only), syncs it, then renames it over the file.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join(Self::file_name(self.network));
+        let path = dir.join(self.own_file_name());
         let tmp: PathBuf = path.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         let mut opts = std::fs::OpenOptions::new();
@@ -667,6 +723,41 @@ mod tests {
         assert!(b.harvested(&onion(6), 8333, 0x09, NOW, &seed, NOW).is_err(), "no compact filters");
         assert!(b.harvested(&onion(6), 8333, X49, NOW - 4 * DAY, &seed, NOW).is_err());
         assert_eq!(b.entries.iter().find(|e| e.addr == onion(5)).unwrap().from.as_deref(), Some(seed.as_str()));
+    }
+
+    fn ip_learned(addr: &str, from: &str) -> Learned {
+        Learned { addr: addr.into(), port: 8333, services: X49 | 0x800, seen_at: NOW, from: from.into() }
+    }
+
+    #[test]
+    fn the_clearnet_book_holds_public_addresses_two_per_netgroup() {
+        let mut b = Book::new_clearnet(BNetwork::Mainnet);
+        b.sync_listed(&[("1.2.3.4:8333".into(), X49 | 0x800), ("[2a01:4f8::1]:8333".into(), X49)], 3, &["5.6.7.8:8333".into()], NOW);
+        assert_eq!(at(&b, "1.2.3.4:8333").services, X49 | 0x800, "the list's services, BIP324 among them");
+        let from = "9.9.9.9:8333";
+        assert_eq!(b.learn(&ip_learned("1.2.200.1", from), NOW), Ok(true), "a second peer in 1.2/16");
+        assert_eq!(b.learn(&ip_learned("1.2.200.2", from), NOW), Err("its netgroup already has 2 peers"));
+        assert_eq!(b.learn(&ip_learned("1.2.3.4", from), NOW), Ok(false), "a peer already held only refreshes");
+        assert_eq!(b.learn(&ip_learned("2a01:4f8::9", from), NOW), Ok(true));
+        assert!(b.learn(&ip_learned("2a01:4f8:1::9", from), NOW).is_err(), "the same /32");
+        for bad in ["192.168.1.20", "127.0.0.1", "100.64.0.1", "fd00::1", "2001:db8::1", &onion(3)] {
+            assert!(b.learn(&ip_learned(bad, from), NOW).is_err(), "{bad}");
+        }
+        assert_eq!(b.harvested("8.8.4.4", 8333, X49, NOW, "5.6.7.8:8333", NOW), Ok(true));
+        assert!(b.harvested(&onion(4), 8333, X49, NOW, "5.6.7.8:8333", NOW).is_err());
+        assert!(b.usable(false, NOW).iter().all(|e| e.addr.parse::<IpAddr>().is_ok()) && b.usable(false, NOW).len() == 5);
+        // The onion book still refuses addresses.
+        assert!(book_with(1, 0).learn(&ip_learned("8.8.8.8", from), NOW).is_err());
+        // Each kind has its own file; neither reads the other's.
+        let dir = tempfile::tempdir().unwrap();
+        b.save(dir.path()).unwrap();
+        book_with(1, 0).save(dir.path()).unwrap();
+        assert_eq!(Book::load_clearnet(dir.path(), BNetwork::Mainnet), b);
+        assert!(!Book::load(dir.path(), BNetwork::Mainnet).clearnet);
+        let onion_file = std::fs::read_to_string(dir.path().join(Book::file_name(BNetwork::Mainnet))).unwrap();
+        assert!(!onion_file.contains("clearnet"), "an older build still reads the onion book");
+        std::fs::copy(dir.path().join(Book::file_name(BNetwork::Mainnet)), dir.path().join(Book::clearnet_file_name(BNetwork::Mainnet))).unwrap();
+        assert_eq!(Book::load_clearnet(dir.path(), BNetwork::Mainnet), Book::new_clearnet(BNetwork::Mainnet));
     }
 
     #[test]

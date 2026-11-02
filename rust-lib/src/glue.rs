@@ -16,12 +16,13 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// `{ ok, networks }`: mainnet, testnet4 and signet, and regtest when the instance directory
     /// holds regtest.json.
     fn list_networks(&self) -> String;
-    /// `{ ok, state: unconfigured|unready|configured, configured, unconfigured, proxySet, walletOpen }`.
+    /// `{ ok, state: unconfigured|unready|configured, configured, unconfigured, proxySet, walletOpen,
+    /// torUse, torUseChosen }`.
     fn config_status(&self) -> String;
     /// Fills what is absent: the Tor proxy, and each network's sources (Kyoto on, one Esplora
     /// server for fee rates, every other source off). `{ ok, applied }`. Backend only.
     fn init_defaults(&self) -> String;
-    /// `{ ok, network, configured, walletOpen, proxy, sources: [{ id, kind, url, operator, label, use,
+    /// `{ ok, network, configured, walletOpen, proxy, torUse, torUseChosen, sources: [{ id, kind, url, operator, label, use,
 /// history, tor, lan, hasCredentials, certSha256, route, suspect }], exposes, withoutTor, crossCheck }`; no credential.
     fn get_sources(&self, network: String) -> String;
     /// Replaces the list (a JSON array of sources); answers as get_sources. A source's
@@ -38,11 +39,18 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// user's own at socks5h://host:port; empty clears it, which leaves every source routed
     /// through Tor without a route. Backend only; refused while a wallet is open.
     fn set_proxy(&self, proxy: String) -> String;
+    /// What Tor carries, for every network: `all`, `identifying` (headers and filters direct,
+    /// matched blocks and broadcasts over Tor) or `none` (Tor off, onion sources unrouted); it
+    /// sets `torUseChosen`. `{ ok, torUse, torUseChosen }`. Backend only; refused while any
+    /// wallet is open.
+    fn set_tor_use(&self, mode: String) -> String;
     /// Whether a wallet is open on `network`, which locks its settings. Backend only.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
-    /// `{ ok, network, proxy, chain, history, pending, fees, broadcast, check, peers, crossCheck, unrouted }`,
-/// each role `[{ id, kind, url, operator, route: tor|direct|onion, credentials?, certSha256?, userAdded? }]`,
-/// `peers` `[{ peer: "host:port", source: list|learned|own, ok }]` (`ok`: it ever worked).
+    /// `{ ok, network, proxy, chain, history, pending, fees, broadcast, check, peers, crossCheck, unrouted,
+/// torUse, kyotoSplit }`, each role `[{ id, kind, url, operator, route: tor|direct|onion, credentials?,
+/// certSha256?, userAdded? }]`, `peers` `[{ peer: "host:port", source: list|learned|seed|own, ok,
+/// services? }]` (`ok`: it ever worked; `services` for clearnet peers). `kyotoSplit`, in
+/// `identifying` only: `{ chain: { route: direct, peers }, tor: { route: onion, peers } }`.
 /// Backend and wallet core.
     fn route_table(&self, network: String) -> String;
     /// Marks a source suspect until the backend clears it; `height` decimal, or empty.
@@ -52,21 +60,23 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     fn clear_suspect(&self, network: String, source_id: String) -> String;
     /// `{ ok, network, list: { format, network, version, created, date, note, refreshUrl, peers,
     /// keyId, signature }, ownPeers, usable, counts: { list, learned, seed, usable, okLast30d },
-    /// route, kyotoTor }`; `usable` as route_table's `peers`.
+    /// route, kyotoTor, torUse, clearnet: { list, usable, counts } }`; `usable` as route_table's
+    /// `peers`; `clearnet` null on regtest.
     fn peer_list(&self, network: String) -> String;
     /// The user's own Kyoto peers (a JSON array of host[:port]), which replace the list; `[]`
     /// goes back to it. Answers as peer_list. Backend only; refused while a wallet is open.
     fn set_own_peers(&self, network: String, peers_json: String) -> String;
     /// What Kyoto saw: `{ outcomes: [{ peer, ok, reason? }], learned: [{ addr, port, services,
     /// seenAt, from }] }`, at most 500 of each. An outcome updates the peer's record; the third
-    /// failure in a row skips it for 24 h. A learned peer is kept if it is onion v3 (on regtest,
-    /// on your network), with bits 0, 3 and 6, seen within 3 days. `{ ok, network, outcomes:
+    /// failure in a row skips it for 24 h. A learned peer is kept if it is onion v3, or a public
+    /// IP address at most 2 per /16 or /32 (on regtest, on your network), with bits 0, 3 and 6,
+    /// seen within 3 days. `{ ok, network, outcomes:
     /// { applied, unknown }, learned: { added, updated, refused }, counts }`. Wallet core only.
     fn report_peers(&self, network: String, report_json: String) -> String;
     /// `{ ok, network, overall, pending, sources: [{ id, kind, state, tipHeight, tipHash, rttMs,
-    /// route, checkedAt, error, serverVersion, suspect, certificate?, ... }], tor }` from address-free
-    /// calls only. `tor` is the built-in Tor's `{ state, progress, detail, socks, answered }` while
-    /// the proxy is it, else null; `answered` is false until tor_module answers. A TLS server's `certificate` is `{ certSha256, subject, issuer, notBefore,
+    /// route, checkedAt, error, serverVersion, suspect, certificate?, ... }], tor, torUse, torUseChosen }`
+    /// from address-free calls only. `tor` is the built-in Tor's `{ state, progress, detail, socks,
+    /// answered }` while the proxy is it and Tor is used, else null; `answered` is false until tor_module answers. A TLS server's `certificate` is `{ certSha256, subject, issuer, notBefore,
     /// notAfter, trusted }`, also when untrusted, for the app to offer pinning it.
     fn source_health(&self, network: String) -> String;
     /// Probes `source_id` now, or every enabled server when empty, then answers as
@@ -147,6 +157,10 @@ impl BitcoinNodeModule for BitcoinNodeModuleImpl {
 
     fn set_proxy(&self, proxy: String) -> String {
         self.gated(Access::Backend, |n| n.set_proxy(&proxy))
+    }
+
+    fn set_tor_use(&self, mode: String) -> String {
+        self.gated(Access::Backend, |n| n.set_tor_use(&mode))
     }
 
     fn set_wallet_open(&self, network: String, open: bool) -> String {

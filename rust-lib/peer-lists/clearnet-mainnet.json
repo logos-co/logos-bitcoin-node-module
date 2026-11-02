@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "network": "mainnet",
+  "version": "0",
+  "created": null,
+  "date": null,
+  "note": "No clearnet list yet: it ships with the crawler's next release run. Until then the book learns clearnet peers from Bitcoin Core's fixed seeds and DNS seeds while a wallet is open.",
+  "refreshUrl": null,
+  "peers": [],
+  "keyId": null,
+  "signature": null
+}

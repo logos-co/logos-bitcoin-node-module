@@ -86,6 +86,26 @@ does. A store from before (version 1) whose proxy was the old default, `socks5h:
 moves to `tor` once; a proxy someone chose stays. Older builds set a version 2 store aside as
 unreadable.
 
+### Use Tor for
+
+`set_tor_use(mode)`, backend only and refused while any wallet is open, sets what Tor carries
+for every network, and `torUseChosen`: the app asks once, before the first account, while it is
+false. `config_status`, `get_sources` and `source_health` carry both.
+
+- `all`: every connection through Tor, as before.
+- `identifying` (a new install's default): servers as in `all`. Kyoto takes headers, filter
+  headers and filters directly from clearnet peers, and fetches matched blocks and sends
+  transactions over Tor, one short onion connection each (`kyotoSplit`, under Routes). Nothing
+  identifying falls back to direct.
+- `none`: everything direct. The proxy is not dialled (`route_table.proxy` is null), onion
+  sources go unrouted ("Use Tor for is set to nothing"), Kyoto dials the clearnet book, and
+  tor_module is never asked, so `source_health.tor` is null and Bitcoin leaves the Tor app's
+  "Apps using Tor".
+
+A version 3 store keeps `torUse` and `torUseChosen`. A fresh store starts at `identifying`, not
+chosen; a version 1 or 2 store loads as `all`, not chosen, so an upgrade never weakens its
+routing. Older builds set a version 3 store aside as unreadable, as they did version 2.
+
 Without a route through Tor, `unrouted` says why: no proxy is set, the built-in Tor is starting,
 its SOCKS port is off (the Tor app turns it on), or it is not available. `source_health` carries
 `tor`: `{ state, progress, detail, socks, answered }` for the built-in Tor, null for your own.
@@ -109,8 +129,14 @@ RPC probes check the genesis hash, tip and block-filter availability. Only one R
 be enabled per network. RPC credentials use the same restricted storage and read API as Esplora.
 
 Plus `proxy` (the SOCKS URL to dial; for `tor`, tor_module's port), `peers` (Kyoto's peers,
-below), `crossCheck` (two operators among chain and check) and `unrouted` (enabled sources left
-out, and why: no Tor route, suspect, wrong network). A disabled source is never routed. Entries carry `certSha256` when the source has a
+below), `crossCheck` (two operators among chain and check), `unrouted` (enabled sources left
+out, and why: no Tor route, suspect, wrong network), `torUse`, and `kyotoSplit`.
+
+`kyotoSplit` is set only in `identifying`, with Kyoto on the books (no own peers) and its Tor
+switch on, once both books have usable peers: `{ chain: { route: "direct", peers }, tor: {
+route: "onion", peers } }`, `chain.peers` from the clearnet book with `services`, `tor.peers`
+from the onion book. The Kyoto entry and `peers` stay as in `all`, so a core that does not know
+the key stays all-Tor; until both books have peers, so does every core. A disabled source is never routed. Entries carry `certSha256` when the source has a
 pin, and `userAdded` for a server the person added: the wallet core speaks plain text only to
 such a server on the person's network.
 
@@ -127,6 +153,12 @@ yet. A shipped list that fails is replaced by an empty one that says why. The sh
 **provisional**: each note says how many runs it comes from. Nothing is fetched: a newer list
 comes with a newer build.
 
+The clearnet list, `rust-lib/peer-lists/clearnet-<network>.json` (`peer-list release
+--clearnet`), has the same fields and key, with `peers: [{ peer, services }]` (public IPv4 and
+IPv6 addresses, at most 2 per /16 or /32, services as a decimal string: bit 11 means BIP324)
+and its own tag, `logos-bitcoin-clearnet-peers/1\n`. Until the crawler's first clearnet release
+run, each ships as an unsigned, empty placeholder.
+
 Each install keeps its own book per network, `kyoto_peers_<network>.json` in the persistence
 directory (atomic, owner-only): entries `{ addr, port, services, source: list|learned|seed,
 from?, firstSeen, lastSeen, lastOk, okCount, failStreak, skipUntil }`, services and Unix times
@@ -134,20 +166,25 @@ as decimal strings, `lastOk` and `skipUntil` null when unset. The shipped list s
 `list`; a peer that a newer build's list drops stays as learned (`from: "list"`) if it worked
 here in the last 30 days, and leaves the book otherwise. At most 2,000 entries, and 64 learned
 from any one `from`. A learned peer that never worked is dropped after 7 days, and any learned
-peer without a success in 30 days.
+peer without a success in 30 days. Beside it, `kyoto_clearnet_peers_<network>.json` (none on
+regtest) holds the clearnet list, Core's IPv4 and IPv6 seeds and learned public addresses,
+under the same rules plus at most 2 entries per /16 or /32.
 
 - `report_peers(network, reportJson)`, wallet core only: `{ outcomes: [{ peer, ok, reason? }],
   learned: [{ addr, port, services, seenAt, from }] }`, at most 500 of each. Success sets
   `lastOk`, counts and clears the streak; the third failure in a row skips the peer for 24 h.
-  A learned peer is kept if it is onion v3 (on regtest, on your network), serves bits 0, 3 and
-  6, and was seen within 3 days.
-- `route_table(network).peers`: `[{ peer, source, ok }]`, `ok` if it ever worked, most recent
+  A learned peer is kept if it is onion v3, or a public IP address (in the clearnet book; on
+  regtest, on your network), serves bits 0, 3 and 6, and was seen within 3 days. Outcomes and
+  learned peers go to the book their address belongs to.
+- `route_table(network).peers`: `[{ peer, source, ok, services? }]` from the book Kyoto dials
+  (the clearnet book in `none` or with Kyoto's Tor switch off, with `services`), `ok` if it ever worked, most recent
   success first, then list before learned. Skipped peers are left out unless every peer is
   skipped. Your own peers (`set_own_peers`) replace the book, as `source: "own"`. Kyoto has one
   connection type for every peer, so your network's peers and peers through Tor don't mix, and
   an onion peer needs Tor.
-- `peer_list(network)`: the signed list, own peers, `usable` (as `peers`) and `counts: { list,
-  learned, seed, usable, okLast30d }`.
+- `peer_list(network)`: the signed list, own peers, `usable` (as `peers`), `counts: { list,
+  learned, seed, usable, okLast30d }`, `torUse`, and `clearnet: { list, usable, counts }`
+  (null on regtest).
 
 Bitcoin Core 31.1's fixed seeds, onion v3 only, ship as `peer-lists/seeds-<network>.json`
 (`peer-list seeds` from Core's `contrib/seeds`) and enter the book as `seed`; they never go to
@@ -157,6 +194,12 @@ the rules above, as learned with `from` the seed: a day after a harvest a seed a
 after one none answered (at most 3 tries a day), and only while a wallet is open on that
 network, with Kyoto on, no own peers and a proxy. On regtest, `regtest.json` may name loopback
 or LAN seeds, reached directly: `{ "harvestSeeds": ["127.0.0.1:18444"] }`.
+
+Core 31.2's public IPv4 and IPv6 fixed seeds ship as `peer-lists/clearnet-seeds-<network>.json`
+and seed the clearnet book the same way. Its harvest runs only while Kyoto takes the chain
+directly (`identifying` with a route, `none`, or Kyoto's Tor switch off), never through Tor:
+up to 8 seeds dialled directly, and Core's DNS seeds that answer `x49.<seed>`, asked through
+the system resolver and kept as learned with `from` `dns:<seed>`.
 
 ## Health
 

@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 
 use crate::health::{Health, State};
 use crate::net::client::{dial, Route};
-use crate::net::p2p::{Gossip, Peer};
+use crate::net::p2p::{Gossip, Peer, X49};
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::net::{electrum, esplora};
 use crate::network::BNetwork;
@@ -27,6 +27,8 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(50);
 pub const MAX_CONCURRENT: usize = 4;
 /// One fixed seed: the onion connection, the handshake and the getaddr answer.
 pub const HARVEST_TIMEOUT: Duration = Duration::from_secs(90);
+/// One DNS seed's answer, from the system resolver.
+const DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const GETADDR_WINDOW: Duration = Duration::from_secs(15);
 
 pub struct Poller {
@@ -148,10 +150,20 @@ async fn run_job(node: Arc<Node>, job: Job) {
     }
 }
 
-/// Asks each seed of `h` for addresses, four at a time, and records what passes.
+/// Asks each seed of `h` for addresses, four at a time, and records what passes. A clearnet
+/// harvest first asks its DNS seeds for `x49.<seed>`, through the system resolver.
 pub async fn harvest(node: Arc<Node>, h: Harvest) -> usize {
     let proxy = h.proxy.as_deref().and_then(|p| ProxyAddr::parse(p).ok());
     let net = h.network;
+    let mut learned = 0;
+    for seed in &h.dns {
+        let name = format!("x49.{seed}");
+        let found = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((name.as_str(), net.p2p_port()))).await;
+        let Ok(Ok(addrs)) = found else { continue };
+        let time = now() as u32;
+        let gossip: Vec<Gossip> = addrs.map(|a| Gossip { host: a.ip().to_string(), port: a.port(), services: X49, time }).collect();
+        learned += node.record_harvest(net, &format!("dns:{seed}"), &gossip, true).added;
+    }
     let mut asked = stream::iter(h.seeds)
         .map(|(seed, route)| {
             let proxy = proxy.clone();
@@ -161,10 +173,9 @@ pub async fn harvest(node: Arc<Node>, h: Harvest) -> usize {
             }
         })
         .buffer_unordered(MAX_CONCURRENT);
-    let mut learned = 0;
     while let Some((seed, r)) = asked.next().await {
         if let Ok(gossip) = r {
-            learned += node.record_harvest(net, &seed, &gossip).added;
+            learned += node.record_harvest(net, &seed, &gossip, h.clearnet).added;
         }
     }
     learned
