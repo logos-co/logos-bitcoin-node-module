@@ -1,7 +1,7 @@
 {
   "format": 1,
   "network": "mainnet",
-  "source": "Bitcoin Core 31.1 contrib/seeds/nodes_main.txt, onion v3 only",
+  "source": "Bitcoin Core 31.2 contrib/seeds/nodes_main.txt, onion v3 only",
   "peers": [
     "2boy2eupcrkymvf456swszxglxgckeoasshdasbgp4kt6jobovnmb5ad.onion:8333",
     "2dsiqghzk2ky2morcscv7ivws5qy5ztqasxnpxchttqumhzrhpdxqpad.onion:8333",

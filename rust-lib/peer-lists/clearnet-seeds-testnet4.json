@@ -1,7 +1,7 @@
 {
   "format": 1,
   "network": "testnet4",
-  "source": "Bitcoin Core 31.1 contrib/seeds/nodes_testnet4.txt, public IPv4 and IPv6 only",
+  "source": "Bitcoin Core 31.2 contrib/seeds/nodes_testnet4.txt, public IPv4 and IPv6 only",
   "peers": [
     "103.165.192.201:48333",
     "103.165.192.210:48333",

@@ -1,7 +1,7 @@
 {
   "format": 1,
   "network": "testnet4",
-  "source": "Bitcoin Core 31.1 contrib/seeds/nodes_testnet4.txt, onion v3 only",
+  "source": "Bitcoin Core 31.2 contrib/seeds/nodes_testnet4.txt, onion v3 only",
   "peers": [
     "24i3bbceydddhykco65oai2dmxirqtvwyom3kyxwzaxbldaog4filyyd.onion:48333",
     "2m4yjmxoamgtzskezmaqwrhfi5hnnzehv44q3fj3ryjwhtz5e53cqmyd.onion:48333",
