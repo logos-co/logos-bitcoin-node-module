@@ -1,7 +1,7 @@
 {
   "format": 1,
   "network": "mainnet",
-  "source": "Bitcoin Core 31.2 contrib/seeds/nodes_main.txt, public IPv4 and IPv6 only",
+  "source": "Bitcoin Core 31.1 contrib/seeds/nodes_main.txt, public IPv4 and IPv6 only",
   "peers": [
     "101.173.70.101:8333",
     "102.132.147.216:8333",

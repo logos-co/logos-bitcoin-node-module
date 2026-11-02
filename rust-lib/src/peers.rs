@@ -10,7 +10,8 @@ use crate::addr;
 use crate::net::client::{is_lan_host, is_onion, Route};
 use crate::network::BNetwork;
 
-pub const FORMAT: u32 = 1;
+/// 2 since `keyId`, `signature` and `refreshUrl` left with the signature (2026-11-02).
+pub const FORMAT: u32 = 2;
 /// Distinct peers of your own; a signet node list can reach 20 or more.
 pub const MAX_OWN_PEERS: usize = 64;
 pub const MAX_LIST_PEERS: usize = 1024;
@@ -24,7 +25,7 @@ pub const PER_NETGROUP: usize = 2;
 pub struct PeerList {
     pub format: u32,
     pub network: BNetwork,
-    /// Grows with each release; a fetched list replaces this one only when newer.
+    /// Grows with each release.
     #[serde(serialize_with = "crate::strnum::ser", deserialize_with = "crate::strnum::de")]
     pub version: u64,
     /// When the crawler built it, YYYY-MM-DDTHH:MM:SSZ.
@@ -32,8 +33,6 @@ pub struct PeerList {
     /// The UTC day the crawler last checked the peers, YYYY-MM-DD.
     pub date: Option<String>,
     pub note: String,
-    /// Where newer lists are published; none until the crawler runs.
-    pub refresh_url: Option<String>,
     /// `host:port`: v3 onion services or IP addresses, never a name to resolve.
     pub peers: Vec<String>,
 }
@@ -57,11 +56,13 @@ impl PeerList {
         if self.network != net {
             return Err(format!("the peer list is for {}, not {}", self.network.name(), net.name()));
         }
-        if self.peers.len() > MAX_LIST_PEERS {
-            return Err(format!("a peer list holds at most {MAX_LIST_PEERS} peers"));
+        if self.peers.is_empty() || self.peers.len() > MAX_LIST_PEERS {
+            return Err(format!("a peer list holds 1 to {MAX_LIST_PEERS} peers"));
         }
         for p in &self.peers {
-            if normalize_peer(net, p).as_deref() != Ok(p.as_str()) || is_lan_host(peer_host(p)) {
+            let h = peer_host(p);
+            let onion_ok = !h.ends_with(".onion") || crate::net::p2p::onion_key(h).is_some();
+            if normalize_peer(net, p).as_deref() != Ok(p.as_str()) || is_lan_host(h) || !onion_ok {
                 return Err(format!("peer list: {p} is not an onion service or public IP address as host:port"));
             }
         }
@@ -71,14 +72,11 @@ impl PeerList {
         if self.created.as_deref().is_some_and(|t| !time_ok(t)) {
             return Err("peer list: created must be YYYY-MM-DDTHH:MM:SSZ".into());
         }
-        if let Some(u) = &self.refresh_url {
-            crate::addr::esplora(u).map_err(|e| format!("peer list refreshUrl: {e}"))?;
-        }
         Ok(())
     }
 
     fn empty(net: BNetwork, note: &str) -> Self {
-        Self { format: FORMAT, network: net, version: 0, created: None, date: None, note: note.into(), refresh_url: None, peers: vec![] }
+        Self { format: FORMAT, network: net, version: 0, created: None, date: None, note: note.into(), peers: vec![] }
     }
 }
 
@@ -102,7 +100,6 @@ pub struct ClearnetList {
     pub created: Option<String>,
     pub date: Option<String>,
     pub note: String,
-    pub refresh_url: Option<String>,
     pub peers: Vec<ClearnetPeer>,
 }
 
@@ -114,8 +111,8 @@ impl ClearnetList {
         if self.network != net {
             return Err(format!("the clearnet list is for {}, not {}", self.network.name(), net.name()));
         }
-        if self.peers.len() > MAX_LIST_PEERS {
-            return Err(format!("a clearnet list holds at most {MAX_LIST_PEERS} peers"));
+        if self.peers.is_empty() || self.peers.len() > MAX_LIST_PEERS {
+            return Err(format!("a clearnet list holds 1 to {MAX_LIST_PEERS} peers"));
         }
         let mut groups: std::collections::HashMap<(u8, u32), usize> = std::collections::HashMap::new();
         for p in &self.peers {
@@ -132,14 +129,11 @@ impl ClearnetList {
         if self.date.as_deref().is_some_and(|d| !date_ok(d)) || self.created.as_deref().is_some_and(|t| !time_ok(t)) {
             return Err("clearnet list: date must be YYYY-MM-DD and created YYYY-MM-DDTHH:MM:SSZ".into());
         }
-        if let Some(u) = &self.refresh_url {
-            crate::addr::esplora(u).map_err(|e| format!("clearnet list refreshUrl: {e}"))?;
-        }
         Ok(())
     }
 
     fn empty(net: BNetwork, note: &str) -> Self {
-        Self { format: FORMAT, network: net, version: 0, created: None, date: None, note: note.into(), refresh_url: None, peers: vec![] }
+        Self { format: FORMAT, network: net, version: 0, created: None, date: None, note: note.into(), peers: vec![] }
     }
 }
 
@@ -386,9 +380,10 @@ pub(crate) mod tests {
         }).collect()
     }
 
-    /// A list of made-up onions.
+    /// A list of made-up onions with valid checksums.
     pub(crate) fn made_up(net: BNetwork, version: u64, note: &str) -> PeerList {
-        PeerList { version, created: Some("2026-10-11T02:00:00Z".into()), date: Some("2026-10-11".into()), peers: fake_onions(3), ..PeerList::empty(net, note) }
+        let peers = (1..=3u8).map(|i| format!("{}:8333", crate::net::p2p::onion_from_key(&[i; 32]))).collect();
+        PeerList { version, created: Some("2026-10-11T02:00:00Z".into()), date: Some("2026-10-11".into()), peers, ..PeerList::empty(net, note) }
     }
 
     #[test]
@@ -400,7 +395,6 @@ pub(crate) mod tests {
             assert!(l.peers.iter().all(|p| is_onion(peer_host(p))), "{net:?}: onion v3 only");
         }
         let r = shipped(BNetwork::Regtest);
-        r.validate(BNetwork::Regtest).unwrap();
         assert!(r.peers.is_empty() && r.version == 0 && r.note.contains("set_own_peers"));
         // A shipped list that fails its check is replaced by an empty one that says why.
         let mut bad = shipped(BNetwork::Signet);
@@ -489,6 +483,11 @@ pub(crate) mod tests {
         assert!(lan.validate(BNetwork::Mainnet).is_err(), "no LAN peer in a curated list");
         let bad_time = PeerList { created: Some("2026-10-11 02:00".into()), ..made_up(BNetwork::Mainnet, 2, "t") };
         assert!(bad_time.validate(BNetwork::Mainnet).unwrap_err().contains("created"));
+        made_up(BNetwork::Mainnet, 2, "ok").validate(BNetwork::Mainnet).unwrap();
+        // A v3 name with a wrong checksum or version, and an empty list, are refused.
+        let bad_sum = PeerList { peers: vec![format!("{}.onion:8333", "q".repeat(56))], ..made_up(BNetwork::Mainnet, 2, "sum") };
+        assert!(bad_sum.validate(BNetwork::Mainnet).unwrap_err().contains("not an onion service"));
+        assert!(PeerList { peers: vec![], ..made_up(BNetwork::Mainnet, 2, "none") }.validate(BNetwork::Mainnet).unwrap_err().contains("1 to"));
     }
 
     #[test]
@@ -511,19 +510,22 @@ pub(crate) mod tests {
     fn the_list_format() {
         let l = made_up(BNetwork::Signet, 7, "n");
         let m = serde_json::to_string(&l).unwrap();
-        assert!(m.starts_with("{\"format\":1,\"network\":\"signet\",\"version\":\"7\",\"created\":\"2026-10-11T02:00:00Z\",\"date\":\"2026-10-11\",\"note\":\"n\",\"refreshUrl\":null,\"peers\":["), "{m}");
-        // The signed format's keyId and signature are gone, and refused.
-        let mut v = serde_json::to_value(&l).unwrap();
-        v["signature"] = serde_json::Value::Null;
-        assert!(serde_json::from_value::<PeerList>(v).is_err());
+        assert!(m.starts_with("{\"format\":2,\"network\":\"signet\",\"version\":\"7\",\"created\":\"2026-10-11T02:00:00Z\",\"date\":\"2026-10-11\",\"note\":\"n\",\"peers\":["), "{m}");
+        // Format 1's keyId, signature and refreshUrl are refused, and so is format 1.
+        for gone in ["keyId", "signature", "refreshUrl"] {
+            let mut v = serde_json::to_value(&l).unwrap();
+            v[gone] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<PeerList>(v).is_err(), "{gone}");
+        }
+        assert!(PeerList { format: 1, ..l }.validate(BNetwork::Signet).unwrap_err().contains("format 1 is not 2"));
     }
 
     #[test]
-    fn the_clearnet_list_placeholders_and_core_seeds() {
+    fn the_clearnet_lists_and_core_seeds() {
         for net in [BNetwork::Mainnet, BNetwork::Signet, BNetwork::Testnet4] {
             let l = shipped_clearnet(net);
             l.validate(net).unwrap();
-            assert!(l.peers.is_empty() && l.note.contains("No clearnet list yet"), "{net:?}: a placeholder until the release run");
+            assert!(!l.peers.is_empty() && l.version > 0 && l.created.is_some(), "{net:?}");
             let seeds = clearnet_seeds(net);
             assert!(seeds.len() > 50, "{net:?}: Core 31.2's IPv4 and IPv6 seeds");
             assert!(seeds.iter().all(|p| peer_host(p).parse::<IpAddr>().is_ok_and(public_ip) && p.ends_with(&format!(":{}", net.p2p_port()))), "{net:?}");
@@ -539,8 +541,8 @@ pub(crate) mod tests {
         l.validate(BNetwork::Signet).unwrap();
         // The crawler's format (logos-bitcoin-peer-list, list.rs).
         let m = serde_json::to_string(&l).unwrap();
-        assert!(m.starts_with("{\"format\":1,\"network\":\"signet\",\"version\":\"7\",\"created\":\"2026-11-02T18:00:00Z\",\"date\":null,\"note\":\"n\",\"refreshUrl\":null,\"peers\":[{\"peer\":\"1.2.3.4:38333\",\"services\":\"3145\"},"), "{m}");
-        for bad in [vec![peer("192.168.1.2:38333", 73)], vec![peer(&format!("{}.onion:38333", "a2".repeat(28)), 73)], vec![peer("1.2.3.4:38333", 73), peer("1.2.5.5:38333", 73), peer("1.2.6.6:38333", 73)]] {
+        assert!(m.starts_with("{\"format\":2,\"network\":\"signet\",\"version\":\"7\",\"created\":\"2026-11-02T18:00:00Z\",\"date\":null,\"note\":\"n\",\"peers\":[{\"peer\":\"1.2.3.4:38333\",\"services\":\"3145\"},"), "{m}");
+        for bad in [vec![], vec![peer("192.168.1.2:38333", 73)], vec![peer(&format!("{}.onion:38333", "a2".repeat(28)), 73)], vec![peer("1.2.3.4:38333", 73), peer("1.2.5.5:38333", 73), peer("1.2.6.6:38333", 73)]] {
             assert!(ClearnetList { peers: bad.clone(), ..l.clone() }.validate(BNetwork::Signet).is_err(), "{bad:?}");
         }
         // A shipped list that fails its check is refused, with why.

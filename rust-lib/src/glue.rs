@@ -58,7 +58,7 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     fn report_mismatch(&self, network: String, source_id: String, kind: String, height: String) -> String;
     /// `{ ok, network, sourceId, cleared }`. Backend only.
     fn clear_suspect(&self, network: String, source_id: String) -> String;
-    /// `{ ok, network, list: { format, network, version, created, date, note, refreshUrl, peers },
+    /// `{ ok, network, list: { format, network, version, created, date, note, peers },
     /// ownPeers, usable, counts: { list, learned, seed, usable, okLast30d },
     /// route, kyotoTor, torUse, clearnet: { list, usable, counts } }`; `usable` as route_table's
     /// `peers`; `clearnet` null on regtest.

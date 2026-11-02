@@ -1,11 +1,10 @@
 {
-  "format": 1,
+  "format": 2,
   "network": "testnet4",
   "version": "202610110832",
   "created": "2026-10-11T08:32:28Z",
   "date": "2026-10-11",
   "note": "PROVISIONAL: the one testnet4 onion peer serving BIP157 filters the crawler found (2026-10-11: version handshake with bits 0, 3 and 6; getcfheaders answered for a stop block from an independent server). No filter-header reference on testnet4.",
-  "refreshUrl": null,
   "peers": [
     "a6yijgwn4vtmmhl7uybtbuyvtl7mtj7arld5f4csqsx4syeii4gt3vqd.onion:48333"
   ]

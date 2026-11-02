@@ -143,19 +143,22 @@ such a server on the person's network.
 ## Kyoto's peers
 
 The curated list per network is `rust-lib/peer-lists/<network>.json`, written at release time
-by the crawler (logos-bitcoin-peer-list, `peer-list release`): format 1, a `version`, when it
-was built (`created`), the day of its last run (`date`), a note, `refreshUrl` (null), and onion
-v3 peers as `host:port`. The lists are not signed: they are compiled in (`include_str!`), nothing
-fetches them, and Jenkins signs the package. A list fetched at runtime would need a signature
-again. Each shipped list is checked when first used (format, network, well-formed public or
-onion peers, dates); one that fails is replaced by an empty one that says why. The shipped lists
+by the crawler (logos-bitcoin-peer-list, `peer-list release`): format 2, a `version`, when it
+was built (`created`), the day of its last run (`date`), a note, and onion v3 peers as
+`host:port`. The lists are not signed: they are compiled in (`include_str!`), nothing fetches
+them, and Jenkins signs the package, which covers them. Format 2 is format 1 without `keyId`,
+`signature` and `refreshUrl`; a list fetched at runtime would need a signature, and a newer
+format, again. Each shipped list is checked when first used: the format, the network, at least
+one peer, each peer a v3 onion name whose checksum and version check or a public IP, and the
+dates. One that fails is replaced by an empty one that says why. The shipped lists
 are **provisional**: each note says how many runs it comes from. A newer list comes with a newer
 build.
 
 The clearnet list, `rust-lib/peer-lists/clearnet-<network>.json` (`peer-list release
 --clearnet`), has the same fields, with `peers: [{ peer, services }]` (public IPv4 and IPv6
-addresses, at most 2 per /16 or /32, services as a decimal string: bit 11 means BIP324). Until
-the crawler's first clearnet release run, each ships as an empty placeholder.
+addresses, at most 2 per /16 or /32, services as a decimal string: bit 11 means BIP324). The
+2026-11-02 release run renewed every list but testnet4's onion one: its one peer did not answer,
+so the 2026-10-11 list stays.
 
 Each install keeps its own book per network, `kyoto_peers_<network>.json` in the persistence
 directory (atomic, owner-only): entries `{ addr, port, services, source: list|learned|seed,
