@@ -1,7 +1,9 @@
-//! The module without the SDK: source lists, the proxy, the route table, Kyoto's peers, health
-//! and events. The glue gates callers and forwards here; replies are flat JSON strings.
+//! The module without the SDK: source lists, the proxy, what Tor is used for, the route table,
+//! Kyoto's peers, health and events. The glue gates callers and forwards here; replies are flat
+//! JSON strings.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,20 +13,21 @@ use tokio::sync::Notify;
 
 use crate::book::{self, Book, Report};
 use crate::health::{self, Health, Row, State};
-use crate::net::client::{is_lan_host, route_for, Route};
+use crate::net::client::{is_lan_host, is_onion, route_for, Route};
 use crate::net::p2p::Gossip;
 use crate::network::{bad_network, networks, BNetwork};
 use crate::peers::{self, peer_host};
 use crate::proxy::{self, BUILT_IN, DEFAULT_PROXY};
 use crate::reply;
 use crate::sources::{self, Changes, Credentials, Kind, Source, LOCAL_ID};
-use crate::store::{NetConfig, Store, Suspicion};
+use crate::store::{NetConfig, Store, Suspicion, TorUse};
 
 pub const NO_PROXY: &str = "no proxy is set";
 pub const TOR_STARTING: &str = "the Tor that comes with Logos is starting";
 pub const TOR_SOCKS_OFF: &str = "Tor's SOCKS port is off: turn it on in the Tor app";
 pub const TOR_MISSING: &str = "the Tor that comes with Logos is not available";
 pub const LOCKED: &str = "Close the wallet to change these settings.";
+pub const TOR_OFF: &str = "Use Tor for is set to nothing: onion services are off";
 pub const SUSPECT: &str = "suspect";
 /// How long probe waits on the network, inside the 20 s IPC deadline.
 pub const CALL_BUDGET: Duration = Duration::from_secs(15);
@@ -63,6 +66,9 @@ pub struct Harvest {
     /// `host:port` and the route to it.
     pub seeds: Vec<(String, Route)>,
     pub proxy: Option<String>,
+    /// For the clearnet book: every seed direct, and `dns` asked through the system resolver.
+    pub clearnet: bool,
+    pub dns: Vec<String>,
 }
 
 /// The built-in Tor as tor_module last reported it.
@@ -129,8 +135,9 @@ struct Inner {
     sent_routes: HashMap<BNetwork, String>,
     /// Networks the backend says a wallet is open on: their settings are locked.
     wallet_open: BTreeSet<BNetwork>,
-    /// Kyoto's peer book per network, kept beside the sources file.
+    /// Kyoto's peer books per network, onion and clearnet (none on regtest), beside the sources file.
     books: BTreeMap<BNetwork, Book>,
+    clear_books: BTreeMap<BNetwork, Book>,
     dir: Option<PathBuf>,
     /// Regtest's fixed seeds: a test-only setting from regtest.json.
     regtest_seeds: Vec<String>,
@@ -164,12 +171,24 @@ impl Inner {
         self.store.networks.get(&net)
     }
 
-    fn route_of(cfg: &NetConfig, s: &Source) -> Route {
+    /// A source's route; with `torUse` none every switch reads off, and an onion stays onion.
+    fn route_of(&self, cfg: &NetConfig, s: &Source) -> Route {
+        let tor = s.tor && self.tor_on();
         match s.kind {
             Kind::Local => Route::Direct,
-            Kind::Kyoto => peers::kyoto_route(&cfg.own_peers, s.tor),
-            _ => route_for(&sources::host(s), s.tor),
+            Kind::Kyoto if !tor && cfg.own_peers.iter().any(|p| is_onion(peer_host(p))) => Route::Onion,
+            Kind::Kyoto => peers::kyoto_route(&cfg.own_peers, tor),
+            _ => route_for(&sources::host(s), tor),
         }
+    }
+
+    fn tor_on(&self) -> bool {
+        self.store.tor_use.tor()
+    }
+
+    /// Kyoto dials the onion book: Tor is used and Kyoto's switch is on. Regtest has one book.
+    fn kyoto_onion(&self, net: BNetwork, cfg: &NetConfig) -> bool {
+        net == BNetwork::Regtest || (self.tor_on() && cfg.kyoto_tor())
     }
 
     fn lan_of(cfg: &NetConfig, s: &Source) -> bool {
@@ -182,6 +201,9 @@ impl Inner {
 
     /// Where Tor routes dial: the user's own Tor, or the built-in one's SOCKS port while it has one.
     fn dial_proxy(&self) -> Option<&str> {
+        if !self.tor_on() {
+            return None;
+        }
         match self.store.proxy() {
             Some(BUILT_IN) => self.tor.as_ref().and_then(|t| t.socks.as_deref()),
             p => p,
@@ -190,6 +212,9 @@ impl Inner {
 
     /// Why Tor routes have nowhere to dial.
     fn no_proxy(&self) -> &'static str {
+        if !self.tor_on() {
+            return TOR_OFF;
+        }
         match (self.store.proxy(), &self.tor) {
             (Some(BUILT_IN), None) => TOR_STARTING,
             (Some(BUILT_IN), Some(t)) if t.answered => TOR_SOCKS_OFF,
@@ -199,9 +224,9 @@ impl Inner {
         }
     }
 
-    /// The built-in Tor for health, while the proxy is it.
+    /// The built-in Tor for health, while the proxy is it and Tor is used.
     fn tor_value(&self) -> Value {
-        if self.store.proxy() != Some(BUILT_IN) {
+        if self.store.proxy() != Some(BUILT_IN) || !self.tor_on() {
             return Value::Null;
         }
         match &self.tor {
@@ -212,7 +237,7 @@ impl Inner {
 
     /// Fail closed: a source whose route goes through Tor has none without the proxy.
     fn blocked(&self, cfg: &NetConfig, s: &Source) -> Option<&'static str> {
-        let tor = matches!(Self::route_of(cfg, s), Route::Tor | Route::Onion);
+        let tor = matches!(self.route_of(cfg, s), Route::Tor | Route::Onion);
         (tor && self.dial_proxy().is_none()).then(|| self.no_proxy())
     }
 
@@ -244,7 +269,7 @@ impl Inner {
     }
 
     fn target(&self, net: BNetwork, cfg: &NetConfig, s: &Source) -> Target {
-        let route = Self::route_of(cfg, s);
+        let route = self.route_of(cfg, s);
         let proxy = matches!(route, Route::Tor | Route::Onion).then(|| self.dial_proxy().map(String::from)).flatten();
         Target {
             network: net,
@@ -258,25 +283,51 @@ impl Inner {
         }
     }
 
-    /// Every peer Kyoto may dial, `{ peer, source, ok }`: your own peers, which replace the book,
-    /// or the book's list and learned peers, skipped ones left out.
+    /// Every peer Kyoto may dial, `{ peer, source, ok }`: your own peers, which replace the
+    /// books, or the list and learned peers of the book Kyoto dials, skipped ones left out.
+    /// Clearnet peers carry `services`, so Kyoto knows which offer BIP324.
     fn usable(&self, net: BNetwork, cfg: &NetConfig) -> Vec<Value> {
         if !cfg.own_peers.is_empty() {
             return cfg.own_peers.iter().map(|p| json!({"peer": p, "source": "own", "ok": false})).collect();
         }
+        if self.kyoto_onion(net, cfg) {
+            self.onion_usable(net, cfg.kyoto_tor())
+        } else {
+            self.clear_usable(net)
+        }
+    }
+
+    fn onion_usable(&self, net: BNetwork, tor: bool) -> Vec<Value> {
         let Some(book) = self.books.get(&net) else { return vec![] };
-        book.usable(cfg.kyoto_tor(), now()).into_iter().map(|e| json!({"peer": e.peer(), "source": e.source, "ok": e.last_ok.is_some()})).collect()
+        book.usable(tor, now()).into_iter().map(|e| json!({"peer": e.peer(), "source": e.source, "ok": e.last_ok.is_some()})).collect()
+    }
+
+    fn clear_usable(&self, net: BNetwork) -> Vec<Value> {
+        let Some(book) = self.clear_books.get(&net) else { return vec![] };
+        book.usable(false, now()).into_iter().map(|e| json!({"peer": e.peer(), "source": e.source, "ok": e.last_ok.is_some(), "services": e.services.to_string()})).collect()
+    }
+
+    /// `identifying`, Kyoto on the books with Tor: headers and filters from clearnet peers,
+    /// matched blocks and broadcasts as onion errands. None until both books have peers, so
+    /// Kyoto stays all-Tor meanwhile; an older core ignores the key and stays all-Tor too.
+    fn kyoto_split(&self, net: BNetwork, cfg: &NetConfig) -> Option<Value> {
+        if self.store.tor_use != TorUse::Identifying || !cfg.own_peers.is_empty() || !cfg.kyoto_tor() || net == BNetwork::Regtest {
+            return None;
+        }
+        let (chain, tor) = (self.clear_usable(net), self.onion_usable(net, true));
+        (!chain.is_empty() && !tor.is_empty()).then(|| json!({"chain": {"route": Route::Direct, "peers": chain}, "tor": {"route": Route::Onion, "peers": tor}}))
     }
 
     fn save_book(&self, net: BNetwork) {
-        if let (Some(dir), Some(b)) = (&self.dir, self.books.get(&net)) {
+        let Some(dir) = &self.dir else { return };
+        for b in [self.books.get(&net), self.clear_books.get(&net)].into_iter().flatten() {
             if let Err(e) = b.save(dir) {
-                eprintln!("bitcoin_node_module: saving the {} peer book: {e}", net.name());
+                eprintln!("bitcoin_node_module: saving a {} peer book: {e}", net.name());
             }
         }
     }
 
-    /// The book on disk (or a new one), merged with the shipped list and seeds, pruned.
+    /// The books on disk (or new ones), merged with the shipped lists and seeds, pruned.
     fn load_book(&mut self, net: BNetwork) {
         let loaded = self.dir.as_deref().map(|d| Book::load(d, net)).unwrap_or_else(|| Book::new(net));
         let mut b = loaded.clone();
@@ -284,21 +335,33 @@ impl Inner {
         let seeds = if net == BNetwork::Regtest { self.regtest_seeds.clone() } else { peers::fixed_seeds(net).to_vec() };
         b.sync_shipped(&list.peers, list.version, &seeds, now());
         b.prune(now());
-        let changed = b != loaded;
+        let mut changed = b != loaded;
         self.books.insert(net, b);
+        if net != BNetwork::Regtest {
+            let loaded = self.dir.as_deref().map(|d| Book::load_clearnet(d, net)).unwrap_or_else(|| Book::new_clearnet(net));
+            let mut c = loaded.clone();
+            let list = peers::shipped_clearnet(net);
+            let listed: Vec<(String, u64)> = list.peers.iter().map(|p| (p.peer.clone(), p.services)).collect();
+            c.sync_listed(&listed, list.version, peers::clearnet_seeds(net), now());
+            c.prune(now());
+            changed |= c != loaded;
+            self.clear_books.insert(net, c);
+        }
         if changed {
             self.save_book(net);
         }
     }
 
     fn roles(&self, net: BNetwork, cfg: &NetConfig) -> sources::Roles {
-        sources::roles(&cfg.sources, |s| Self::route_of(cfg, s), |s| self.unrouted(net, cfg, s).is_none())
+        sources::roles(&cfg.sources, |s| self.route_of(cfg, s), |s| self.unrouted(net, cfg, s).is_none())
     }
 
     fn route_table(&self, net: BNetwork) -> String {
         let Some(cfg) = self.cfg(net) else { return reply::err(not_configured(net)) };
         let r = self.roles(net, cfg);
-        let peers = if r.history.iter().any(|e| e.kind == Kind::Kyoto) { self.usable(net, cfg) } else { vec![] };
+        let routed = r.history.iter().any(|e| e.kind == Kind::Kyoto);
+        let peers = if routed { self.usable(net, cfg) } else { vec![] };
+        let split = if routed { self.kyoto_split(net, cfg) } else { None };
         let unrouted: Vec<Value> = cfg
             .sources
             .iter()
@@ -317,6 +380,8 @@ impl Inner {
             "peers": peers,
             "crossCheck": r.cross_check,
             "unrouted": unrouted,
+            "torUse": self.store.tor_use,
+            "kyotoSplit": split,
         }))
     }
 
@@ -325,9 +390,10 @@ impl Inner {
         let wallet_open = self.wallet_open.contains(&net);
         let Some(cfg) = self.cfg(net) else {
             return json!({"network": net.name(), "configured": false, "walletOpen": wallet_open, "proxy": self.store.proxy(),
+                          "torUse": self.store.tor_use, "torUseChosen": self.store.tor_use_chosen,
                           "sources": [], "exposes": [], "withoutTor": [], "crossCheck": false});
         };
-        let route = |s: &Source| Self::route_of(cfg, s);
+        let route = |s: &Source| self.route_of(cfg, s);
         let lan = |s: &Source| Self::lan_of(cfg, s);
         let list: Vec<Value> = cfg
             .sources
@@ -343,6 +409,8 @@ impl Inner {
             "configured": true,
             "walletOpen": wallet_open,
             "proxy": self.store.proxy(),
+            "torUse": self.store.tor_use,
+            "torUseChosen": self.store.tor_use_chosen,
             "sources": list,
             "exposes": sources::exposes(&cfg.sources, lan),
             "withoutTor": sources::without_tor(&cfg.sources, route, lan),
@@ -356,7 +424,8 @@ impl Inner {
         }
         let n = self.usable(net, cfg).len();
         if n == 0 {
-            let why = format!("no peer to dial: {}", peers::shipped(net).note);
+            let note = if self.kyoto_onion(net, cfg) { peers::shipped(net).note } else { peers::shipped_clearnet(net).note };
+            let why = format!("no peer to dial: {note}");
             return (Health { state: State::NoPeers, error: Some(why), ..Health::default() }, 0);
         }
         (Health { state: State::NotProbed, ..Health::default() }, n)
@@ -365,7 +434,8 @@ impl Inner {
     /// source_health()'s fields, without `ok`.
     fn health_value(&self, net: BNetwork) -> Value {
         let Some(cfg) = self.cfg(net) else {
-            return json!({"network": net.name(), "configured": false, "overall": health::Overall::Offline, "pending": false, "sources": []});
+            return json!({"network": net.name(), "configured": false, "overall": health::Overall::Offline, "pending": false, "sources": [],
+                          "torUse": self.store.tor_use, "torUseChosen": self.store.tor_use_chosen});
         };
         let measured: Vec<(&Source, Option<Health>, usize)> = cfg
             .sources
@@ -397,7 +467,7 @@ impl Inner {
                         ("operator", json!(s.operator)),
                         ("label", json!(s.label)),
                         ("use", json!(s.enabled)),
-                        ("route", json!(Self::route_of(cfg, s))),
+                        ("route", json!(self.route_of(cfg, s))),
                         ("suspect", json!(sus.is_some())),
                         ("suspectKind", json!(sus.map(|x| &x.kind))),
                         ("suspectHeight", json!(sus.and_then(|x| x.height).map(|h| h.to_string()))),
@@ -418,25 +488,34 @@ impl Inner {
             "pending": measured.iter().any(|(s, h, _)| s.enabled && h.is_none()),
             "sources": list,
             "tor": self.tor_value(),
+            "torUse": self.store.tor_use,
+            "torUseChosen": self.store.tor_use_chosen,
         })
     }
 
     fn counts(&self, net: BNetwork, cfg: &NetConfig) -> book::Counts {
-        let mut c = self.books.get(&net).map(|b| b.counts(cfg.kyoto_tor(), now())).unwrap_or_default();
+        let book = if self.kyoto_onion(net, cfg) { self.books.get(&net) } else { self.clear_books.get(&net) };
+        let mut c = book.map(|b| b.counts(cfg.kyoto_tor() && self.kyoto_onion(net, cfg), now())).unwrap_or_default();
         c.usable = self.usable(net, cfg).len();
         c
     }
 
     fn peer_list_value(&self, net: BNetwork, cfg: &NetConfig) -> Value {
         let tor = cfg.kyoto_tor();
+        let kyoto = cfg.sources.iter().find(|s| s.kind == Kind::Kyoto).cloned().unwrap_or_else(|| sources::kyoto(true));
+        let clearnet = self.clear_books.get(&net).map(|b| {
+            json!({"list": peers::shipped_clearnet(net), "usable": self.clear_usable(net), "counts": b.counts(false, now())})
+        });
         json!({
             "network": net.name(),
             "list": peers::shipped(net),
             "ownPeers": cfg.own_peers,
             "usable": self.usable(net, cfg),
             "counts": self.counts(net, cfg),
-            "route": peers::kyoto_route(&cfg.own_peers, tor),
+            "route": self.route_of(cfg, &kyoto),
             "kyotoTor": tor,
+            "torUse": self.store.tor_use,
+            "clearnet": clearnet,
         })
     }
 
@@ -486,6 +565,7 @@ impl Node {
             sent_routes: HashMap::new(),
             wallet_open: BTreeSet::new(),
             books: BTreeMap::new(),
+            clear_books: BTreeMap::new(),
             dir,
             regtest_seeds: vec![],
             tor: None,
@@ -518,7 +598,8 @@ impl Node {
     }
 
     /// The wallet core's report on Kyoto's peers: outcomes, which update each peer's record and
-    /// skip one for 24 h after 3 failures in a row, and peers learned from gossip.
+    /// skip one for 24 h after 3 failures in a row, and peers learned from gossip. IP addresses
+    /// go to the clearnet book (regtest's one book holds its LAN peers), onions to the onion book.
     pub fn report_peers(&self, network: &str, report_json: &str) -> String {
         let net = match parse_net(network) {
             Ok(n) => n,
@@ -531,18 +612,29 @@ impl Node {
         let (out, events) = {
             let mut inner = self.lock();
             let now = now();
-            let Some(book) = inner.books.get_mut(&net) else { return reply::err(format!("no peer book for {}", net.name())) };
+            if !inner.books.contains_key(&net) {
+                return reply::err(format!("no peer book for {}", net.name()));
+            }
+            let clear = |host: &str| net != BNetwork::Regtest && host.parse::<IpAddr>().is_ok();
+            let Inner { books, clear_books, .. } = &mut *inner;
             let (mut applied, mut unknown) = (0, 0);
             for o in &report.outcomes {
-                if book.outcome(&o.peer, o.ok, now) {
+                let book = if clear(peer_host(&o.peer)) { clear_books.get_mut(&net) } else { books.get_mut(&net) };
+                if book.is_some_and(|b| b.outcome(&o.peer, o.ok, now)) {
                     applied += 1;
                 } else {
                     unknown += 1;
                 }
             }
-            let results: Vec<_> = report.learned.iter().map(|l| book.learn(l, now)).collect();
+            let mut results = Vec::with_capacity(report.learned.len());
+            for l in &report.learned {
+                let book = if clear(&l.addr) { clear_books.get_mut(&net) } else { books.get_mut(&net) };
+                results.push(book.map_or(Err("no peer book"), |b| b.learn(l, now)));
+            }
             let learned = Book::tally(results);
-            book.prune(now);
+            for b in [books.get_mut(&net), clear_books.get_mut(&net)].into_iter().flatten() {
+                b.prune(now);
+            }
             inner.save_book(net);
             let counts = inner.cfg(net).map(|c| inner.counts(net, c)).unwrap_or_default();
             let out = reply::ok(json!({"network": net.name(), "outcomes": {"applied": applied, "unknown": unknown}, "learned": learned, "counts": counts}));
@@ -554,7 +646,9 @@ impl Node {
 
     /// Networks with a wallet open whose book holds fewer than 12 usable peers that worked in
     /// 30 days, Kyoto on and dialling the book, when a harvest is due (`Book::harvest_due`): up
-    /// to 8 seeds each. An onion seed needs the proxy; only regtest's test seeds go direct.
+    /// to 8 seeds each. An onion seed needs the proxy; only regtest's test seeds go direct. The
+    /// clearnet book, while Kyoto takes the chain directly, dials its seeds directly and asks the
+    /// DNS seeds through the system resolver.
     pub fn harvest_plan(&self) -> Vec<Harvest> {
         let mut inner = self.lock();
         let now = now();
@@ -562,12 +656,23 @@ impl Node {
         let mut out = Vec::new();
         for net in networks() {
             let Some(cfg) = inner.cfg(net) else { continue };
-            let kyoto = cfg.sources.iter().any(|s| s.kind == Kind::Kyoto && s.enabled);
-            if !kyoto || !cfg.own_peers.is_empty() || !inner.wallet_open.contains(&net) {
+            let Some(kyoto) = cfg.sources.iter().find(|s| s.kind == Kind::Kyoto && s.enabled) else { continue };
+            if !cfg.own_peers.is_empty() || !inner.wallet_open.contains(&net) {
                 continue;
             }
             let tor = cfg.kyoto_tor();
-            let Some(book) = inner.books.get(&net) else { continue };
+            let onion = inner.kyoto_onion(net, cfg);
+            // Not while Kyoto has no route: in `identifying` without a proxy it does not run.
+            let clear = (!onion || (inner.store.tor_use == TorUse::Identifying && tor)) && inner.blocked(cfg, kyoto).is_none();
+            if clear && inner.clear_books.get(&net).is_some_and(|b| b.harvest_due(false, now)) {
+                let b = inner.clear_books.get_mut(&net).expect("checked");
+                let seeds = b.pick_seeds().into_iter().map(|p| (p, Route::Direct)).collect();
+                b.harvest_started(now);
+                inner.save_book(net);
+                let dns = peers::dns_seeds(net).iter().map(|d| d.to_string()).collect();
+                out.push(Harvest { network: net, seeds, proxy: None, clearnet: true, dns });
+            }
+            let Some(book) = inner.books.get(&net).filter(|_| onion) else { continue };
             if !book.harvest_due(tor, now) {
                 continue;
             }
@@ -588,18 +693,19 @@ impl Node {
             }
             inner.save_book(net);
             let proxy = seeds.iter().any(|(_, r)| *r == Route::Onion).then(|| proxy.clone()).flatten();
-            out.push(Harvest { network: net, seeds, proxy });
+            out.push(Harvest { network: net, seeds, proxy, clearnet: false, dns: vec![] });
         }
         out
     }
 
-    /// What a seed that answered gossiped: onion v3 peers with bits 0, 3 and 6 seen within 3
-    /// days, as learned. The harvest counts as answered.
-    pub fn record_harvest(&self, net: BNetwork, seed: &str, gossip: &[Gossip]) -> book::Learning {
+    /// What a seed that answered gossiped: onion v3 peers (public IPs for the clearnet book) with
+    /// bits 0, 3 and 6 seen within 3 days, as learned. The harvest counts as answered.
+    pub fn record_harvest(&self, net: BNetwork, seed: &str, gossip: &[Gossip], clearnet: bool) -> book::Learning {
         let (learning, events) = {
             let mut inner = self.lock();
             let now = now();
-            let Some(book) = inner.books.get_mut(&net) else { return book::Learning::default() };
+            let books = if clearnet { &mut inner.clear_books } else { &mut inner.books };
+            let Some(book) = books.get_mut(&net) else { return book::Learning::default() };
             book.harvest_answered = true;
             let results: Vec<_> = gossip.iter().map(|g| book.harvested(&g.host, g.port, g.services, u64::from(g.time), seed, now)).collect();
             let learning = Book::tally(results);
@@ -611,10 +717,11 @@ impl Node {
         learning
     }
 
-    /// Whether the proxy is the built-in Tor: only then is tor_module asked, and asking is what
-    /// starts it.
+    /// Whether the proxy is the built-in Tor and Tor is used: only then is tor_module asked, and
+    /// asking is what starts it.
     pub fn uses_built_in_tor(&self) -> bool {
-        self.lock().store.proxy() == Some(BUILT_IN)
+        let inner = self.lock();
+        inner.store.proxy() == Some(BUILT_IN) && inner.tor_on()
     }
 
     /// tor_module's latest status. Routes follow its SOCKS port and health shows it. The poller
@@ -717,7 +824,8 @@ impl Node {
             _ => "unready",
         };
         reply::ok(json!({"state": state, "configured": names(configured), "unconfigured": names(unconfigured),
-                         "proxySet": proxy_set, "walletOpen": names(inner.wallet_open.iter().copied())}))
+                         "proxySet": proxy_set, "walletOpen": names(inner.wallet_open.iter().copied()),
+                         "torUse": inner.store.tor_use, "torUseChosen": inner.store.tor_use_chosen}))
     }
 
     /// Fills what is absent, field by field: the proxy, and each network's sources (Kyoto on,
@@ -815,6 +923,23 @@ impl Node {
                 Ok(((), vec![]))
             },
             |inner, ()| reply::ok(json!({"proxy": inner.store.proxy()})),
+        )
+    }
+
+    /// What Tor carries, for every network, and that the person chose it. Refused while any
+    /// wallet is open.
+    pub fn set_tor_use(&self, mode: &str) -> String {
+        let Some(m) = TorUse::parse(mode) else { return reply::err(format!("{}torUse must be all, identifying or none", reply::INVALID)) };
+        self.mutate(
+            true,
+            |store, open| {
+                if !open.is_empty() {
+                    return Err(LOCKED.into());
+                }
+                (store.tor_use, store.tor_use_chosen) = (m, true);
+                Ok(((), vec![]))
+            },
+            |inner, ()| reply::ok(json!({"torUse": inner.store.tor_use, "torUseChosen": inner.store.tor_use_chosen})),
         )
     }
 

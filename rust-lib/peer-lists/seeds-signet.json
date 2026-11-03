@@ -1,7 +1,7 @@
 {
   "format": 1,
   "network": "signet",
-  "source": "Bitcoin Core 31.1 contrib/seeds/nodes_signet.txt, onion v3 only",
+  "source": "Bitcoin Core 31.2 contrib/seeds/nodes_signet.txt, onion v3 only",
   "peers": [
     "2uqd5pbaxn26o7fl7nqtm2khetqocislppxtxrpqg55wtbcqdrf2y5qd.onion:38333",
     "2ycyu2aba3xsqjr35beqporp5f64ntqs2sau2amn5ztq4j5q76amhqyd.onion:38333",

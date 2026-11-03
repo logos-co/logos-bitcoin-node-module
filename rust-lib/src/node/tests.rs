@@ -457,6 +457,7 @@ fn the_wallet_core_reports_on_kyotos_peers() {
 #[test]
 fn the_fixed_seeds_are_asked_only_when_the_book_runs_short() {
     let h = configured();
+    h.node.set_tor_use("all");
     assert!(h.node.harvest_plan().is_empty(), "no wallet open");
     h.node.set_wallet_open("signet", true);
     let plan = h.node.harvest_plan();
@@ -469,7 +470,7 @@ fn the_fixed_seeds_are_asked_only_when_the_book_runs_short() {
     // What a seed gossiped becomes learned, credited to it.
     let seed = plan[0].seeds[0].0.clone();
     let g = |host: String, services: u64| Gossip { host, port: 38333, services, time: now() as u32 };
-    let l = h.node.record_harvest(BNetwork::Signet, &seed, &[g(onion_v3(9), 0x49), g("203.0.113.5".into(), 0x49), g(onion_v3(10), 0x09)]);
+    let l = h.node.record_harvest(BNetwork::Signet, &seed, &[g(onion_v3(9), 0x49), g("203.0.113.5".into(), 0x49), g(onion_v3(10), 0x09)], false);
     assert_eq!((l.added, l.refused), (1, 2));
     let book = book(&h);
     assert_eq!(book["harvestAnswered"], true, "a seed answered");
@@ -488,6 +489,10 @@ fn the_fixed_seeds_are_asked_only_when_the_book_runs_short() {
     fine.node.report_peers("mainnet", &json!({"outcomes": outcomes}).to_string());
     fine.node.set_wallet_open("mainnet", true);
     for (name, n) in [("own peers", &own), ("no proxy", &off), ("12 worked", &fine)] {
+        n.node.set_wallet_open("signet", false);
+        n.node.set_wallet_open("mainnet", false);
+        n.node.set_tor_use("all");
+        n.node.set_wallet_open(if name == "12 worked" { "mainnet" } else { "signet" }, true);
         assert!(n.node.harvest_plan().is_empty(), "{name}");
     }
 }
@@ -739,4 +744,113 @@ fn tor_modules_status_reply() {
     let missing = TorView::from_reply(Err("object_unavailable".into()));
     assert_eq!((missing.state.as_str(), missing.answered), ("failed", false));
     assert_eq!(ok(r#"{"ok":true,"state":"ready","socks":"socks5://127.0.0.1:9250"}"#).socks, None, "never a port that resolves names locally");
+}
+
+fn clear_gossip(hosts: &[&str]) -> Vec<Gossip> {
+    hosts.iter().map(|h| Gossip { host: h.to_string(), port: 38333, services: 0x849, time: now() as u32 }).collect()
+}
+
+#[test]
+fn tor_use_is_chosen_once_and_locked_while_a_wallet_is_open() {
+    let h = configured();
+    let status = |h: &Harness| v(h.node.config_status());
+    assert_eq!((&status(&h)["torUse"], &status(&h)["torUseChosen"]), (&json!("identifying"), &json!(false)), "a fresh install");
+    assert_eq!(v(h.node.set_tor_use("everything"))["error"], "invalid parameters: torUse must be all, identifying or none");
+    h.node.set_wallet_open("testnet4", true);
+    assert_eq!(v(h.node.set_tor_use("none"))["error"], LOCKED, "any open wallet locks it");
+    h.node.set_wallet_open("testnet4", false);
+    assert_eq!(v(h.node.set_tor_use("none")), json!({"ok": true, "torUse": "none", "torUseChosen": true}));
+    for (name, r) in [("sources", v(h.node.get_sources("signet"))), ("health", v(h.node.source_health("signet"))), ("status", status(&h))] {
+        assert_eq!((&r["torUse"], &r["torUseChosen"]), (&json!("none"), &json!(true)), "{name}");
+    }
+    let again = Node::open(Some(h.dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
+    assert_eq!(v(again.config_status())["torUse"], "none", "kept");
+}
+
+#[test]
+fn none_turns_tor_off_and_kyoto_dials_the_clearnet_book() {
+    let h = configured();
+    assert!(h.node.uses_built_in_tor());
+    h.node.set_tor_use("none");
+    assert!(!h.node.uses_built_in_tor(), "tor_module is never asked");
+    let t = v(h.node.route_table("signet"));
+    assert_eq!((&t["proxy"], &t["torUse"], &t["kyotoSplit"]), (&Value::Null, &json!("none"), &Value::Null));
+    for role in ["chain", "history", "fees", "broadcast", "check"] {
+        assert!(t[role].as_array().unwrap().iter().all(|e| e["route"] == "direct"), "{role}: {t}");
+    }
+    let unrouted = t["unrouted"].as_array().unwrap();
+    assert!(!unrouted.is_empty() && unrouted.iter().all(|u| u["reason"] == TOR_OFF && u["id"].as_str().unwrap().ends_with("-onion")), "{unrouted:?}");
+    let listed: Vec<String> = peers::shipped_clearnet(BNetwork::Signet).peers.into_iter().map(|p| p.peer).collect();
+    let start = peer_strings(&t["peers"]);
+    assert!(!start.is_empty() && start.iter().all(|p| listed.contains(p)), "the shipped clearnet list: {start:?}");
+    assert_eq!(v(h.node.source_health("signet"))["tor"], Value::Null);
+    // While a wallet is open: Core's clearnet seeds directly, and the DNS seeds, never through Tor.
+    h.node.set_wallet_open("signet", true);
+    let plan = h.node.harvest_plan();
+    assert_eq!(plan.len(), 1, "no onion harvest without Tor");
+    let p = &plan[0];
+    assert!(p.clearnet && p.proxy.is_none() && p.seeds.len() == 8 && p.dns == ["seed.signet.bitcoin.sprovoost.nl", "seed.signet.achownodes.xyz"]);
+    assert!(p.seeds.iter().all(|(s, r)| *r == Route::Direct && peers::clearnet_seeds(BNetwork::Signet).contains(s)));
+    // 11.22/16 is in no crawled list.
+    let l = h.node.record_harvest(BNetwork::Signet, &p.seeds[0].0, &clear_gossip(&["11.22.3.4", "11.22.9.9", "11.22.10.10", "192.168.1.5", &onion_v3(4)]), true);
+    assert_eq!((l.added, l.refused), (2, 3), "the third in 11.22/16, a LAN address and an onion refused");
+    let usable = v(h.node.peer_list("signet"))["clearnet"]["usable"].clone();
+    let learned = |peer: &str| usable.as_array().unwrap().iter().find(|p| p["peer"] == peer).cloned();
+    assert_eq!(learned("11.22.3.4:38333").map(|p| p["services"].clone()), Some(json!("2121")), "BIP324 shows in the services: {usable}");
+    assert!(learned("11.22.9.9:38333").is_some() && learned("11.22.10.10:38333").is_none());
+    assert_eq!(route_of(&v(h.node.route_table("signet")), "chain", KYOTO_ID), "direct");
+    // An onion peer of your own has no route.
+    h.node.set_wallet_open("signet", false);
+    h.node.set_tor_use("all");
+    h.node.set_own_peers("signet", &json!([format!("{}:38333", onion())]).to_string());
+    h.node.set_tor_use("none");
+    assert!(v(h.node.route_table("signet"))["unrouted"].as_array().unwrap().iter().any(|u| u["id"] == KYOTO_ID && u["reason"] == TOR_OFF));
+}
+
+#[test]
+fn identifying_splits_kyoto_once_both_books_have_peers() {
+    let h = configured();
+    let t = v(h.node.route_table("signet"));
+    let onion_peers = t["peers"].clone();
+    assert_eq!(t["torUse"], json!("identifying"));
+    assert_eq!(route_of(&t, "chain", KYOTO_ID), "onion", "the mode-1 entry stays all-Tor for an older core");
+    // Both books have peers from the start: the shipped onion and clearnet lists.
+    let listed: Vec<String> = peers::shipped_clearnet(BNetwork::Signet).peers.into_iter().map(|p| p.peer).collect();
+    let split = &t["kyotoSplit"];
+    assert_eq!((&split["chain"]["route"], &split["tor"]["route"]), (&json!("direct"), &json!("onion")));
+    let chain = peer_strings(&split["chain"]["peers"]);
+    assert!(!chain.is_empty() && chain.iter().all(|p| listed.contains(p)), "{chain:?}");
+    assert_eq!(split["tor"]["peers"], onion_peers);
+    h.node.set_wallet_open("signet", true);
+    let plan = h.node.harvest_plan();
+    assert_eq!(plan.iter().map(|p| p.clearnet).collect::<Vec<_>>(), [true, false], "both books are asked");
+    let seed = plan[0].seeds[0].0.clone();
+    h.node.record_harvest(BNetwork::Signet, &seed, &clear_gossip(&["11.22.3.4", "11.33.7.8"]), true);
+    // The core's report: IP addresses to the clearnet book, onions to the onion book.
+    let seen = now();
+    let r = v(h.node.report_peers("signet", &json!({"outcomes": [{"peer": "11.22.3.4:38333", "ok": true}],
+        "learned": [{"addr": "9.9.9.9", "port": 38333, "services": 2121, "seenAt": seen, "from": "11.22.3.4:38333"},
+                    {"addr": onion_v3(7), "port": 38333, "services": 73, "seenAt": seen, "from": "11.22.3.4:38333"}]}).to_string()));
+    assert_eq!((&r["outcomes"]["applied"], &r["learned"]["added"]), (&json!(1), &json!(2)), "{r}");
+    let t = v(h.node.route_table("signet"));
+    assert!(peer_strings(&t["kyotoSplit"]["chain"]["peers"]).contains(&"9.9.9.9:38333".to_string()));
+    assert!(peer_strings(&t["kyotoSplit"]["tor"]["peers"]).contains(&format!("{}:38333", onion_v3(7))));
+    assert_eq!(t["kyotoSplit"]["chain"]["peers"][0]["peer"], "11.22.3.4:38333", "the peer that worked first");
+    let clear = &v(h.node.peer_list("signet"))["clearnet"];
+    let version = peers::shipped_clearnet(BNetwork::Signet).version.to_string();
+    assert_eq!((&clear["counts"]["learned"], &clear["list"]["version"]), (&json!(3), &json!(version)));
+    // Kyoto's own Tor switch off: all of Kyoto direct on the clearnet book, no split.
+    h.node.set_wallet_open("signet", false);
+    h.node.set_source("signet", KYOTO_ID, r#"{"tor":false}"#);
+    let t = v(h.node.route_table("signet"));
+    assert_eq!((route_of(&t, "chain", KYOTO_ID).as_str(), &t["kyotoSplit"]), ("direct", &Value::Null));
+    assert!(peer_strings(&t["peers"]).contains(&"9.9.9.9:38333".to_string()));
+    // All, or peers of your own: no split.
+    h.node.set_source("signet", KYOTO_ID, r#"{"tor":true}"#);
+    h.node.set_tor_use("all");
+    assert_eq!(v(h.node.route_table("signet"))["kyotoSplit"], Value::Null);
+    h.node.set_tor_use("identifying");
+    assert!(v(h.node.route_table("signet"))["kyotoSplit"].is_object());
+    h.node.set_own_peers("signet", r#"["192.168.1.20"]"#);
+    assert_eq!(v(h.node.route_table("signet"))["kyotoSplit"], Value::Null);
 }

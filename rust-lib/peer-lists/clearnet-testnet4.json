@@ -1,0 +1,14 @@
+{
+  "format": 2,
+  "network": "testnet4",
+  "version": "202611022026",
+  "created": "2026-11-02T20:26:11Z",
+  "date": "2026-11-02",
+  "note": "IPv4 and IPv6 peers serving BIP157 compact filters that passed every check, dialled directly, in 1 of the last 1 runs (handshake only); at most 2 per /16 or /32.",
+  "peers": [
+    {
+      "peer": "216.230.225.61:48333",
+      "services": "3149"
+    }
+  ]
+}

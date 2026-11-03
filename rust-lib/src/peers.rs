@@ -1,47 +1,40 @@
-//! Kyoto's peers: the curated list per network (versioned, signed with a key compiled in here),
-//! the user's own peers, which replace it, and the peers Kyoto's route can use.
+//! Kyoto's peers: the curated lists per network (onion and clearnet, versioned, compiled in),
+//! the user's own peers, which replace them, and the peers Kyoto's route can use.
 
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
-use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 
 use crate::addr;
 use crate::net::client::{is_lan_host, is_onion, Route};
 use crate::network::BNetwork;
 
-pub const FORMAT: u32 = 1;
+/// 2 since `keyId`, `signature` and `refreshUrl` left with the signature (2026-11-02).
+pub const FORMAT: u32 = 2;
 /// Distinct peers of your own; a signet node list can reach 20 or more.
 pub const MAX_OWN_PEERS: usize = 64;
 pub const MAX_LIST_PEERS: usize = 1024;
-/// In front of the canonical JSON, so a list key's signature means nothing anywhere else.
-pub const DOMAIN: &[u8] = b"logos-bitcoin-peer-list/1\n";
-/// The public half of the TEST key the crawler (logos-bitcoin-peer-list) signs with. The release
-/// key is not chosen yet; it replaces this one.
-const TEST_KEY: &str = include_str!("../keys/peer-list-test-key.pub.json");
+/// Clearnet peers kept per /16 (IPv4) or /32 (IPv6), in the list and in the book.
+pub const PER_NETGROUP: usize = 2;
 
-/// A curated peer list as the crawler publishes it. The signature covers `signed_message()`.
+/// A curated peer list as the crawler writes it. Unsigned: it is compiled in, and Jenkins signs
+/// the package; a list fetched at runtime would need a signature again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PeerList {
     pub format: u32,
     pub network: BNetwork,
-    /// Grows with each release; a fetched list replaces this one only when newer.
+    /// Grows with each release.
     #[serde(serialize_with = "crate::strnum::ser", deserialize_with = "crate::strnum::de")]
     pub version: u64,
-    /// When the crawler built and signed it, YYYY-MM-DDTHH:MM:SSZ.
+    /// When the crawler built it, YYYY-MM-DDTHH:MM:SSZ.
     pub created: Option<String>,
     /// The UTC day the crawler last checked the peers, YYYY-MM-DD.
     pub date: Option<String>,
     pub note: String,
-    /// Where newer lists are published; none until the crawler runs.
-    pub refresh_url: Option<String>,
     /// `host:port`: v3 onion services or IP addresses, never a name to resolve.
     pub peers: Vec<String>,
-    /// The release key that signed it.
-    pub key_id: Option<String>,
-    pub signature: Option<String>,
 }
 
 fn date_ok(d: &str) -> bool {
@@ -63,11 +56,13 @@ impl PeerList {
         if self.network != net {
             return Err(format!("the peer list is for {}, not {}", self.network.name(), net.name()));
         }
-        if self.peers.len() > MAX_LIST_PEERS {
-            return Err(format!("a peer list holds at most {MAX_LIST_PEERS} peers"));
+        if self.peers.is_empty() || self.peers.len() > MAX_LIST_PEERS {
+            return Err(format!("a peer list holds 1 to {MAX_LIST_PEERS} peers"));
         }
         for p in &self.peers {
-            if normalize_peer(net, p).as_deref() != Ok(p.as_str()) || is_lan_host(peer_host(p)) {
+            let h = peer_host(p);
+            let onion_ok = !h.ends_with(".onion") || crate::net::p2p::onion_key(h).is_some();
+            if normalize_peer(net, p).as_deref() != Ok(p.as_str()) || is_lan_host(h) || !onion_ok {
                 return Err(format!("peer list: {p} is not an onion service or public IP address as host:port"));
             }
         }
@@ -77,69 +72,115 @@ impl PeerList {
         if self.created.as_deref().is_some_and(|t| !time_ok(t)) {
             return Err("peer list: created must be YYYY-MM-DDTHH:MM:SSZ".into());
         }
-        if let Some(u) = &self.refresh_url {
-            crate::addr::esplora(u).map_err(|e| format!("peer list refreshUrl: {e}"))?;
+        Ok(())
+    }
+
+    fn empty(net: BNetwork, note: &str) -> Self {
+        Self { format: FORMAT, network: net, version: 0, created: None, date: None, note: note.into(), peers: vec![] }
+    }
+}
+
+/// An IPv4 or IPv6 peer of the clearnet list, with the services it announced (decimal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClearnetPeer {
+    pub peer: String,
+    #[serde(serialize_with = "crate::strnum::ser", deserialize_with = "crate::strnum::de")]
+    pub services: u64,
+}
+
+/// The clearnet list Kyoto syncs headers and filters from when Tor is not used for them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClearnetList {
+    pub format: u32,
+    pub network: BNetwork,
+    #[serde(serialize_with = "crate::strnum::ser", deserialize_with = "crate::strnum::de")]
+    pub version: u64,
+    pub created: Option<String>,
+    pub date: Option<String>,
+    pub note: String,
+    pub peers: Vec<ClearnetPeer>,
+}
+
+impl ClearnetList {
+    pub fn validate(&self, net: BNetwork) -> Result<(), String> {
+        if self.format != FORMAT {
+            return Err(format!("clearnet list format {} is not {FORMAT}", self.format));
+        }
+        if self.network != net {
+            return Err(format!("the clearnet list is for {}, not {}", self.network.name(), net.name()));
+        }
+        if self.peers.is_empty() || self.peers.len() > MAX_LIST_PEERS {
+            return Err(format!("a clearnet list holds 1 to {MAX_LIST_PEERS} peers"));
+        }
+        let mut groups: std::collections::HashMap<(u8, u32), usize> = std::collections::HashMap::new();
+        for p in &self.peers {
+            let ip = peer_host(&p.peer).parse::<IpAddr>().ok().filter(|ip| public_ip(*ip));
+            let Some(ip) = ip.filter(|_| normalize_peer(net, &p.peer).as_deref() == Ok(p.peer.as_str())) else {
+                return Err(format!("clearnet list: {} is not a public IP address as host:port", p.peer));
+            };
+            let n = groups.entry(netgroup(ip)).or_default();
+            *n += 1;
+            if *n > PER_NETGROUP {
+                return Err(format!("clearnet list: more than {PER_NETGROUP} peers in the netgroup of {}", p.peer));
+            }
+        }
+        if self.date.as_deref().is_some_and(|d| !date_ok(d)) || self.created.as_deref().is_some_and(|t| !time_ok(t)) {
+            return Err("clearnet list: date must be YYYY-MM-DD and created YYYY-MM-DDTHH:MM:SSZ".into());
         }
         Ok(())
     }
 
-    /// The bytes a signature covers: `DOMAIN`, then this list with `signature` null, as compact
-    /// JSON in field order (the crawler's canonical bytes).
-    pub fn signed_message(&self) -> Vec<u8> {
-        let unsigned = PeerList { signature: None, ..self.clone() };
-        let mut m = DOMAIN.to_vec();
-        m.extend(serde_json::to_vec(&unsigned).unwrap_or_default());
-        m
-    }
-
     fn empty(net: BNetwork, note: &str) -> Self {
-        Self { format: FORMAT, network: net, version: 0, created: None, date: None, note: note.into(), refresh_url: None, peers: vec![], key_id: None, signature: None }
+        Self { format: FORMAT, network: net, version: 0, created: None, date: None, note: note.into(), peers: vec![] }
     }
 }
 
-/// The keys a list may be signed with, as (key id, Ed25519 public key): the TEST key only.
-fn list_keys() -> &'static [(String, Vec<u8>)] {
-    static KEYS: OnceLock<Vec<(String, Vec<u8>)>> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Key {
-            key_id: String,
-            ed25519: String,
+/// A globally routed unicast address: no private, loopback, link-local, CGNAT, documentation,
+/// benchmarking, multicast or reserved range; IPv6 only from 2000::/3, without Teredo or 6to4.
+pub fn public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            !(o[0] == 0
+                || o[0] == 10
+                || o[0] == 127
+                || o[0] >= 224
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 172 && (16..32).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113))
         }
-        let k: Key = serde_json::from_str(TEST_KEY).expect("the compiled-in list key parses (see tests)");
-        let pk = hex::decode(&k.ed25519).ok().filter(|p| p.len() == 32).expect("the compiled-in list key is 32 bytes of hex");
-        vec![(k.key_id, pk)]
-    })
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            s[0] & 0xe000 == 0x2000 && !(s[0] == 0x2001 && (s[1] == 0 || s[1] == 0xdb8 || (0x10..0x30).contains(&s[1]))) && s[0] != 0x2002
+        }
+    }
 }
 
-/// Checks `signature` over `signed_message()` with the key `keyId` names, among `keys`.
-pub fn verify_with(list: &PeerList, keys: &[(String, Vec<u8>)]) -> Result<(), String> {
-    let id = list.key_id.as_deref().ok_or("the peer list is not signed")?;
-    let (_, pk) = keys.iter().find(|(k, _)| k == id).ok_or_else(|| format!("the peer list is signed with an unknown key {id}"))?;
-    let sig = list.signature.as_deref().and_then(|s| hex::decode(s).ok()).filter(|s| s.len() == 64).ok_or("the peer list's signature is not 64 bytes of hex")?;
-    UnparsedPublicKey::new(&ED25519, pk).verify(&list.signed_message(), &sig).map_err(|_| "the peer list's signature does not check".to_string())
-}
-
-/// Checks a list against the keys compiled into this build.
-pub fn verify(list: &PeerList) -> Result<(), String> {
-    verify_with(list, list_keys())
+/// The /16 of an IPv4 address or the /32 of an IPv6 one.
+pub fn netgroup(ip: IpAddr) -> (u8, u32) {
+    match ip {
+        IpAddr::V4(a) => (4, u32::from(a.octets()[0]) << 8 | u32::from(a.octets()[1])),
+        IpAddr::V6(a) => (6, u32::from(a.segments()[0]) << 16 | u32::from(a.segments()[1])),
+    }
 }
 
 fn load_shipped(net: BNetwork, text: &str) -> PeerList {
     let list: PeerList = serde_json::from_str(text).expect("the shipped peer lists parse (see tests)");
-    // An unsigned, empty placeholder may ship; a list with peers is used only if its signature checks.
-    if list.peers.is_empty() && list.signature.is_none() {
-        return list;
-    }
-    match list.validate(net).and_then(|_| verify(&list)) {
+    match list.validate(net) {
         Ok(()) => list,
         Err(e) => PeerList::empty(net, &format!("The shipped list was refused ({e}): add your own node with set_own_peers.")),
     }
 }
 
-/// The list this build ships, checked once: signed lists for mainnet and signet, a placeholder
-/// for testnet4, none for regtest.
+/// The list this build ships, checked once: lists for mainnet, signet and testnet4, none for
+/// regtest.
 pub fn shipped(net: BNetwork) -> PeerList {
     static LISTS: OnceLock<[PeerList; 3]> = OnceLock::new();
     let lists = LISTS.get_or_init(|| {
@@ -157,33 +198,93 @@ pub fn shipped(net: BNetwork) -> PeerList {
     }
 }
 
-/// Bitcoin Core's fixed seeds this build ships, onion v3 only (peer-lists/seeds-<network>.json,
-/// written by the crawler's `seeds` command). Regtest has none.
-pub fn fixed_seeds(net: BNetwork) -> &'static [String] {
+fn load_shipped_clearnet(net: BNetwork, text: &str) -> ClearnetList {
+    let list: ClearnetList = serde_json::from_str(text).expect("the shipped clearnet lists parse (see tests)");
+    match list.validate(net) {
+        Ok(()) => list,
+        Err(e) => ClearnetList::empty(net, &format!("The shipped clearnet list was refused ({e}).")),
+    }
+}
+
+/// The clearnet list this build ships, checked once; none for regtest.
+pub fn shipped_clearnet(net: BNetwork) -> ClearnetList {
+    static LISTS: OnceLock<[ClearnetList; 3]> = OnceLock::new();
+    let lists = LISTS.get_or_init(|| {
+        [
+            load_shipped_clearnet(BNetwork::Mainnet, include_str!("../peer-lists/clearnet-mainnet.json")),
+            load_shipped_clearnet(BNetwork::Testnet4, include_str!("../peer-lists/clearnet-testnet4.json")),
+            load_shipped_clearnet(BNetwork::Signet, include_str!("../peer-lists/clearnet-signet.json")),
+        ]
+    });
+    match net {
+        BNetwork::Mainnet => lists[0].clone(),
+        BNetwork::Testnet4 => lists[1].clone(),
+        BNetwork::Signet => lists[2].clone(),
+        BNetwork::Regtest => ClearnetList::empty(net, "Regtest has no curated peers: add your node with set_own_peers."),
+    }
+}
+
+fn load_seeds(net: BNetwork, text: &str, keep: fn(&str) -> bool) -> Vec<String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Seeds {
         network: BNetwork,
         peers: Vec<String>,
     }
-    fn load(net: BNetwork, text: &str) -> Vec<String> {
-        let s: Seeds = serde_json::from_str(text).expect("the shipped seeds parse (see tests)");
-        assert_eq!(s.network, net, "seeds for the wrong network");
-        // Only well-formed onion v3 host:port; a bad line is dropped, not dialled.
-        s.peers.into_iter().filter(|p| normalize_peer(net, p).as_deref() == Ok(p.as_str()) && crate::net::p2p::onion_key(peer_host(p)).is_some()).collect()
-    }
+    let s: Seeds = serde_json::from_str(text).expect("the shipped seeds parse (see tests)");
+    assert_eq!(s.network, net, "seeds for the wrong network");
+    // Only well-formed host:port of the right kind; a bad line is dropped, not dialled.
+    s.peers.into_iter().filter(|p| normalize_peer(net, p).as_deref() == Ok(p.as_str()) && keep(peer_host(p))).collect()
+}
+
+/// Bitcoin Core's fixed seeds this build ships, onion v3 only (peer-lists/seeds-<network>.json,
+/// written by the crawler's `seeds` command). Regtest has none.
+pub fn fixed_seeds(net: BNetwork) -> &'static [String] {
+    let onion = |h: &str| crate::net::p2p::onion_key(h).is_some();
     static SEEDS: OnceLock<[Vec<String>; 3]> = OnceLock::new();
     let s = SEEDS.get_or_init(|| {
         [
-            load(BNetwork::Mainnet, include_str!("../peer-lists/seeds-mainnet.json")),
-            load(BNetwork::Testnet4, include_str!("../peer-lists/seeds-testnet4.json")),
-            load(BNetwork::Signet, include_str!("../peer-lists/seeds-signet.json")),
+            load_seeds(BNetwork::Mainnet, include_str!("../peer-lists/seeds-mainnet.json"), onion),
+            load_seeds(BNetwork::Testnet4, include_str!("../peer-lists/seeds-testnet4.json"), onion),
+            load_seeds(BNetwork::Signet, include_str!("../peer-lists/seeds-signet.json"), onion),
         ]
     });
     match net {
         BNetwork::Mainnet => &s[0],
         BNetwork::Testnet4 => &s[1],
         BNetwork::Signet => &s[2],
+        BNetwork::Regtest => &[],
+    }
+}
+
+/// Core's public IPv4 and IPv6 fixed seeds (peer-lists/clearnet-seeds-<network>.json), dialled
+/// directly, only when Kyoto takes the chain from clearnet peers. Regtest has none.
+pub fn clearnet_seeds(net: BNetwork) -> &'static [String] {
+    let public = |h: &str| h.parse::<IpAddr>().is_ok_and(public_ip);
+    static SEEDS: OnceLock<[Vec<String>; 3]> = OnceLock::new();
+    let s = SEEDS.get_or_init(|| {
+        [
+            load_seeds(BNetwork::Mainnet, include_str!("../peer-lists/clearnet-seeds-mainnet.json"), public),
+            load_seeds(BNetwork::Testnet4, include_str!("../peer-lists/clearnet-seeds-testnet4.json"), public),
+            load_seeds(BNetwork::Signet, include_str!("../peer-lists/clearnet-seeds-signet.json"), public),
+        ]
+    });
+    match net {
+        BNetwork::Mainnet => &s[0],
+        BNetwork::Testnet4 => &s[1],
+        BNetwork::Signet => &s[2],
+        BNetwork::Regtest => &[],
+    }
+}
+
+/// Bitcoin Core 31.2's DNS seeds that answer `x49.<seed>` (network, witness and compact
+/// filters; Core's notes say the others answer x9 or less), asked through the system resolver,
+/// only in the direct modes and only when the book runs low.
+pub fn dns_seeds(net: BNetwork) -> &'static [&'static str] {
+    match net {
+        BNetwork::Mainnet => &["seed.bitcoin.sprovoost.nl", "dnsseed.emzy.de", "seed.bitcoin.wiz.biz", "seed.mainnet.achownodes.xyz"],
+        BNetwork::Testnet4 => &["seed.testnet4.bitcoin.sprovoost.nl", "seed.testnet4.wiz.biz"],
+        BNetwork::Signet => &["seed.signet.bitcoin.sprovoost.nl", "seed.signet.achownodes.xyz"],
         BNetwork::Regtest => &[],
     }
 }
@@ -279,52 +380,27 @@ pub(crate) mod tests {
         }).collect()
     }
 
-    /// A key for tests only, from a fixed seed: what it signs checks with `verify_fixture`,
-    /// never with the keys this build ships.
-    fn fixture() -> (ring::signature::Ed25519KeyPair, Vec<(String, Vec<u8>)>) {
-        use ring::signature::KeyPair;
-        let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).unwrap();
-        let keys = vec![("fixture-1".to_string(), pair.public_key().as_ref().to_vec())];
-        (pair, keys)
-    }
-
-    pub(crate) fn sign_fixture(mut l: PeerList) -> PeerList {
-        l.key_id = Some("fixture-1".into());
-        l.signature = None;
-        l.signature = Some(hex::encode(fixture().0.sign(&l.signed_message()).as_ref()));
-        l
-    }
-
-    pub(crate) fn verify_fixture(l: &PeerList) -> Result<(), String> {
-        verify_with(l, &fixture().1)
-    }
-
-    /// A fixture-signed list of made-up onions.
-    pub(crate) fn signed(net: BNetwork, version: u64, note: &str) -> PeerList {
-        let l = PeerList { version, created: Some("2026-10-11T02:00:00Z".into()), date: Some("2026-10-11".into()), peers: fake_onions(3), ..PeerList::empty(net, note) };
-        sign_fixture(l)
+    /// A list of made-up onions with valid checksums.
+    pub(crate) fn made_up(net: BNetwork, version: u64, note: &str) -> PeerList {
+        let peers = (1..=3u8).map(|i| format!("{}:8333", crate::net::p2p::onion_from_key(&[i; 32]))).collect();
+        PeerList { version, created: Some("2026-10-11T02:00:00Z".into()), date: Some("2026-10-11".into()), peers, ..PeerList::empty(net, note) }
     }
 
     #[test]
-    fn shipped_lists_are_signed_with_the_test_key_or_explained() {
-        let test_key = &list_keys()[0].0;
-        assert!(test_key.starts_with("test-"), "{test_key}");
+    fn shipped_lists_are_well_formed_or_explained() {
         for net in [BNetwork::Mainnet, BNetwork::Signet, BNetwork::Testnet4] {
             let l = shipped(net);
             l.validate(net).unwrap();
-            verify(&l).unwrap();
-            assert!(!l.peers.is_empty() && l.version > 0 && l.key_id.as_ref() == Some(test_key), "{net:?}");
+            assert!(!l.peers.is_empty() && l.version > 0 && l.created.is_some(), "{net:?}");
             assert!(l.peers.iter().all(|p| is_onion(peer_host(p))), "{net:?}: onion v3 only");
-            assert!(l.created.is_some() && l.note.contains("TEST key"), "{net:?}");
         }
         let r = shipped(BNetwork::Regtest);
-        r.validate(BNetwork::Regtest).unwrap();
-        assert!(r.peers.is_empty() && r.version == 0 && r.signature.is_none() && r.note.contains("set_own_peers"));
-        // A shipped list whose signature fails is replaced by an empty one that says why.
+        assert!(r.peers.is_empty() && r.version == 0 && r.note.contains("set_own_peers"));
+        // A shipped list that fails its check is replaced by an empty one that says why.
         let mut bad = shipped(BNetwork::Signet);
-        bad.peers.pop();
+        bad.peers.push("192.168.1.20:38333".into());
         let refused = load_shipped(BNetwork::Signet, &serde_json::to_string(&bad).unwrap());
-        assert!(refused.peers.is_empty() && refused.note.contains("does not check"), "{}", refused.note);
+        assert!(refused.peers.is_empty() && refused.note.contains("not an onion service"), "{}", refused.note);
     }
 
     #[test]
@@ -399,40 +475,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_signed_list_checks_and_any_change_breaks_it() {
-        let good = signed(BNetwork::Mainnet, 3, "good");
-        verify_fixture(&good).unwrap();
-        // This build's own keys do not include the fixture key, so it never ships.
-        assert!(verify(&good).unwrap_err().contains("unknown key fixture-1"));
-        let refused = load_shipped(BNetwork::Mainnet, &serde_json::to_string(&good).unwrap());
-        assert!(refused.peers.is_empty() && refused.note.contains("unknown key"));
-        let mut more = good.clone();
-        more.peers.push(fake_onions(4)[3].clone());
-        assert!(verify_fixture(&more).unwrap_err().contains("does not check"), "a peer added after signing");
-        let mut flipped = good.clone();
-        let sig = flipped.signature.take().unwrap();
-        flipped.signature = Some(format!("{}{}", if sig.starts_with('0') { "1" } else { "0" }, &sig[1..]));
-        assert!(verify_fixture(&flipped).unwrap_err().contains("does not check"));
-        assert!(verify_fixture(&PeerList { signature: Some("00".into()), ..good.clone() }).unwrap_err().contains("64 bytes"));
-        assert!(verify_fixture(&PeerList { signature: None, key_id: None, ..good.clone() }).unwrap_err().contains("not signed"));
-        // The bare JSON, without the domain tag, is not what a list key signs.
-        let mut bare = good.clone();
-        bare.signature = Some(hex::encode(fixture().0.sign(&bare.signed_message()[DOMAIN.len()..]).as_ref()));
-        assert!(verify_fixture(&bare).unwrap_err().contains("does not check"));
-    }
-
-    #[test]
     fn a_list_for_another_network_or_malformed_is_refused() {
         let signet = shipped(BNetwork::Signet);
         let as_mainnet = load_shipped(BNetwork::Mainnet, &serde_json::to_string(&signet).unwrap());
         assert!(as_mainnet.peers.is_empty() && as_mainnet.note.contains("for signet, not mainnet"), "{}", as_mainnet.note);
-        // Relabelled, its signature no longer checks.
-        let relabelled = PeerList { network: BNetwork::Mainnet, ..signet.clone() };
-        assert!(verify(&relabelled).unwrap_err().contains("does not check"));
-        let lan = sign_fixture(PeerList { peers: vec!["192.168.1.20:8333".into()], ..signed(BNetwork::Mainnet, 2, "lan") });
+        let lan = PeerList { peers: vec!["192.168.1.20:8333".into()], ..made_up(BNetwork::Mainnet, 2, "lan") };
         assert!(lan.validate(BNetwork::Mainnet).is_err(), "no LAN peer in a curated list");
-        let bad_time = sign_fixture(PeerList { created: Some("2026-10-11 02:00".into()), ..signed(BNetwork::Mainnet, 2, "t") });
+        let bad_time = PeerList { created: Some("2026-10-11 02:00".into()), ..made_up(BNetwork::Mainnet, 2, "t") };
         assert!(bad_time.validate(BNetwork::Mainnet).unwrap_err().contains("created"));
+        made_up(BNetwork::Mainnet, 2, "ok").validate(BNetwork::Mainnet).unwrap();
+        // A v3 name with a wrong checksum or version, and an empty list, are refused.
+        let bad_sum = PeerList { peers: vec![format!("{}.onion:8333", "q".repeat(56))], ..made_up(BNetwork::Mainnet, 2, "sum") };
+        assert!(bad_sum.validate(BNetwork::Mainnet).unwrap_err().contains("not an onion service"));
+        assert!(PeerList { peers: vec![], ..made_up(BNetwork::Mainnet, 2, "none") }.validate(BNetwork::Mainnet).unwrap_err().contains("1 to"));
     }
 
     #[test]
@@ -452,12 +507,47 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_signed_bytes() {
-        let l = signed(BNetwork::Signet, 7, "n");
-        let m = String::from_utf8(l.signed_message()).unwrap();
-        assert!(m.starts_with("logos-bitcoin-peer-list/1\n{\"format\":1,\"network\":\"signet\",\"version\":\"7\",\"created\":\"2026-10-11T02:00:00Z\",\"date\":\"2026-10-11\",\"note\":\"n\","), "{m}");
-        assert!(m.ends_with(",\"keyId\":\"fixture-1\",\"signature\":null}"), "{m}");
-        // The signature covers everything but itself.
-        assert_eq!(PeerList { signature: Some("ff".into()), ..l.clone() }.signed_message(), l.signed_message());
+    fn the_list_format() {
+        let l = made_up(BNetwork::Signet, 7, "n");
+        let m = serde_json::to_string(&l).unwrap();
+        assert!(m.starts_with("{\"format\":2,\"network\":\"signet\",\"version\":\"7\",\"created\":\"2026-10-11T02:00:00Z\",\"date\":\"2026-10-11\",\"note\":\"n\",\"peers\":["), "{m}");
+        // Format 1's keyId, signature and refreshUrl are refused, and so is format 1.
+        for gone in ["keyId", "signature", "refreshUrl"] {
+            let mut v = serde_json::to_value(&l).unwrap();
+            v[gone] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<PeerList>(v).is_err(), "{gone}");
+        }
+        assert!(PeerList { format: 1, ..l }.validate(BNetwork::Signet).unwrap_err().contains("format 1 is not 2"));
+    }
+
+    #[test]
+    fn the_clearnet_lists_and_core_seeds() {
+        for net in [BNetwork::Mainnet, BNetwork::Signet, BNetwork::Testnet4] {
+            let l = shipped_clearnet(net);
+            l.validate(net).unwrap();
+            assert!(!l.peers.is_empty() && l.version > 0 && l.created.is_some(), "{net:?}");
+            let seeds = clearnet_seeds(net);
+            assert!(seeds.len() > 50, "{net:?}: Core 31.2's IPv4 and IPv6 seeds");
+            assert!(seeds.iter().all(|p| peer_host(p).parse::<IpAddr>().is_ok_and(public_ip) && p.ends_with(&format!(":{}", net.p2p_port()))), "{net:?}");
+            assert!(!dns_seeds(net).is_empty());
+        }
+        assert!(clearnet_seeds(BNetwork::Regtest).is_empty() && dns_seeds(BNetwork::Regtest).is_empty());
+    }
+
+    #[test]
+    fn a_clearnet_list_is_well_formed() {
+        let peer = |p: &str, services: u64| ClearnetPeer { peer: p.into(), services };
+        let l = ClearnetList { version: 7, created: Some("2026-11-02T18:00:00Z".into()), peers: vec![peer("1.2.3.4:38333", 3145), peer("[2a01:4f8::1]:38333", 1097)], ..ClearnetList::empty(BNetwork::Signet, "n") };
+        l.validate(BNetwork::Signet).unwrap();
+        // The crawler's format (logos-bitcoin-peer-list, list.rs).
+        let m = serde_json::to_string(&l).unwrap();
+        assert!(m.starts_with("{\"format\":2,\"network\":\"signet\",\"version\":\"7\",\"created\":\"2026-11-02T18:00:00Z\",\"date\":null,\"note\":\"n\",\"peers\":[{\"peer\":\"1.2.3.4:38333\",\"services\":\"3145\"},"), "{m}");
+        for bad in [vec![], vec![peer("192.168.1.2:38333", 73)], vec![peer(&format!("{}.onion:38333", "a2".repeat(28)), 73)], vec![peer("1.2.3.4:38333", 73), peer("1.2.5.5:38333", 73), peer("1.2.6.6:38333", 73)]] {
+            assert!(ClearnetList { peers: bad.clone(), ..l.clone() }.validate(BNetwork::Signet).is_err(), "{bad:?}");
+        }
+        // A shipped list that fails its check is refused, with why.
+        let crowded = ClearnetList { peers: vec![peer("1.2.3.4:38333", 73), peer("1.2.5.5:38333", 73), peer("1.2.6.6:38333", 73)], ..l.clone() };
+        let refused = load_shipped_clearnet(BNetwork::Signet, &serde_json::to_string(&crowded).unwrap());
+        assert!(refused.peers.is_empty() && refused.note.contains("more than 2"), "{}", refused.note);
     }
 }

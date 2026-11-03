@@ -1,5 +1,5 @@
-//! What persists, written atomically and owner-only to `bitcoin_sources.json`: the proxy, and
-//! per network the sources, suspects, own peers and a fetched peer list.
+//! What persists, written atomically and owner-only to `bitcoin_sources.json`: the proxy, what
+//! Tor is used for, and per network the sources, suspects, own peers and a fetched peer list.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -15,8 +15,35 @@ use crate::sources::{self, Kind, Source};
 use crate::strnum::{de, de_opt, double_option, ser, ser_opt};
 
 pub const FILE_NAME: &str = "bitcoin_sources.json";
-/// 2: the proxy may be `tor`, the Tor that comes with Logos, the new default.
-pub const VERSION: u32 = 2;
+/// 2: the proxy may be `tor`, the Tor that comes with Logos. 3: `torUse` and `torUseChosen`.
+pub const VERSION: u32 = 3;
+
+/// What Tor carries: everything, only what identifies the wallet, or nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TorUse {
+    /// The routing of every file before version 3, so an upgrade never weakens it.
+    #[default]
+    All,
+    Identifying,
+    None,
+}
+
+impl TorUse {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "all" => Some(Self::All),
+            "identifying" => Some(Self::Identifying),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Whether any connection goes through Tor.
+    pub fn tor(self) -> bool {
+        self != Self::None
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -93,6 +120,11 @@ pub struct Store {
     pub salt: String,
     #[serde(default)]
     pub networks: BTreeMap<BNetwork, NetConfig>,
+    #[serde(default)]
+    pub tor_use: TorUse,
+    /// Set once the person picked `tor_use`; until then the app asks before any account.
+    #[serde(default)]
+    pub tor_use_chosen: bool,
 }
 
 pub enum Loaded {
@@ -108,16 +140,21 @@ fn fresh_salt() -> String {
 }
 
 impl Store {
-    /// Nothing configured: the backend calls init_defaults.
+    /// Nothing configured: the backend calls init_defaults. A new install starts at
+    /// `identifying`, not yet chosen.
     pub fn empty() -> Self {
-        Self { version: VERSION, proxy: None, salt: fresh_salt(), networks: BTreeMap::new() }
+        Self { version: VERSION, proxy: None, salt: fresh_salt(), networks: BTreeMap::new(), tor_use: TorUse::Identifying, tor_use_chosen: false }
     }
 
     /// Version 1's default, a Tor the user had to run, becomes the Tor that comes with Logos,
     /// once: the file keeps version 1 until the next save, so an older build still reads it.
+    /// Before version 3 everything went through Tor: `all`, not chosen.
     fn upgrade(&mut self) {
         if self.version == 1 && self.proxy() == Some(proxy::OLD_DEFAULT_PROXY) {
             self.proxy = Some(Some(proxy::BUILT_IN.into()));
+        }
+        if self.version < 3 {
+            (self.tor_use, self.tor_use_chosen) = (TorUse::All, false);
         }
         self.version = VERSION;
     }
@@ -339,6 +376,39 @@ mod tests {
         chosen.version = VERSION + 1;
         chosen.save(&path).unwrap();
         assert!(matches!(Store::load(&path), Loaded::Corrupt(e) if e.contains("unknown version")));
+    }
+
+    #[test]
+    fn tor_use_starts_at_identifying_and_older_files_load_as_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let fresh = Store::load_or_empty(&path);
+        assert_eq!((fresh.tor_use, fresh.tor_use_chosen), (TorUse::Identifying, false));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"version\": 3") && text.contains("\"torUse\": \"identifying\"") && text.contains("\"torUseChosen\": false"), "{text}");
+
+        // A version 2 file, which has neither field: everything stays on Tor, the choice still to make.
+        let mut v2 = serde_json::to_value(configured()).unwrap();
+        v2["version"] = 2.into();
+        v2.as_object_mut().unwrap().retain(|k, _| k != "torUse" && k != "torUseChosen");
+        std::fs::write(&path, v2.to_string()).unwrap();
+        let Loaded::Found(up) = Store::load(&path) else { panic!() };
+        assert_eq!((up.version, up.tor_use, up.tor_use_chosen), (VERSION, TorUse::All, false));
+        // Even one that somehow says otherwise.
+        v2["torUse"] = "none".into();
+        v2["torUseChosen"] = true.into();
+        std::fs::write(&path, v2.to_string()).unwrap();
+        let Loaded::Found(up) = Store::load(&path) else { panic!() };
+        assert_eq!((up.tor_use, up.tor_use_chosen), (TorUse::All, false));
+
+        let mut chosen = configured();
+        (chosen.tor_use, chosen.tor_use_chosen) = (TorUse::None, true);
+        chosen.save(&path).unwrap();
+        let Loaded::Found(back) = Store::load(&path) else { panic!() };
+        assert_eq!(back, chosen);
+        std::fs::write(&path, std::fs::read_to_string(&path).unwrap().replace("\"none\"", "\"some\"")).unwrap();
+        assert!(matches!(Store::load(&path), Loaded::Corrupt(_)));
+        assert_eq!([TorUse::parse("all"), TorUse::parse(" none "), TorUse::parse("everything")], [Some(TorUse::All), Some(TorUse::None), None]);
     }
 
     #[test]
