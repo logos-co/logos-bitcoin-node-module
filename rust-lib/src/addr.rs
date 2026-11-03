@@ -151,9 +151,9 @@ pub fn electrum(url: &str) -> Result<String, String> {
     }
 }
 
-/// `https://host[:port][/path]`, or `http://` for onion services and the user's network;
-/// default ports are left out. Credentials in the address come back separately.
-pub fn esplora(url: &str) -> Result<(String, Option<(String, String)>), String> {
+/// A Bitcoin Core RPC endpoint: `https://host[:port][/path]`, or `http://` for onion services and
+/// the user's network; default ports are left out. Credentials in the address come back separately.
+pub fn rpc(url: &str) -> Result<(String, Option<(String, String)>), String> {
     let full = with_scheme(url, "http", "https");
     let p = split(&full)?;
     v3_only(&p, url)?;
@@ -166,7 +166,7 @@ pub fn esplora(url: &str) -> Result<(String, Option<(String, String)>), String> 
         "https" => 443,
         "http" if is_onion(&p.host) || is_lan_host(&p.host) => 80,
         "http" => return Err(format!("{INVALID}{url}: plain http is only for onion services and servers on your network; use https://")),
-        _ => return Err(format!("{url}: an Esplora server is https://host[:port][/path]")),
+        _ => return Err(format!("{url}: an RPC server is https://host[:port][/path]")),
     };
     let port = match p.port {
         Some(port) if port != default_port => format!(":{port}"),
@@ -253,29 +253,28 @@ mod tests {
     }
 
     #[test]
-    fn esplora_addresses() {
+    fn rpc_addresses() {
         for (typed, url) in [
-            ("https://mempool.space/api/", "https://mempool.space/api"),
-            ("mempool.space/testnet4/api", "https://mempool.space/testnet4/api"),
-            ("https://blockstream.info:443/signet/api", "https://blockstream.info/signet/api"),
-            ("https://esplora.example:8443", "https://esplora.example:8443"),
-            ("192.168.1.20:3002/api", "http://192.168.1.20:3002/api"),
+            ("https://node.example/wallet/", "https://node.example/wallet"),
+            ("node.example:8332", "https://node.example:8332"),
+            ("https://node.example:443/rpc", "https://node.example/rpc"),
+            ("192.168.1.20:8332", "http://192.168.1.20:8332"),
             ("http://umbrel.local", "http://umbrel.local"),
         ] {
-            let (u, creds) = esplora(typed).unwrap();
+            let (u, creds) = rpc(typed).unwrap();
             assert_eq!((u.as_str(), creds), (url, None), "{typed}");
         }
-        let (u, creds) = esplora(&format!("{}/api", onion())).unwrap();
-        assert_eq!((u, creds), (format!("http://{}/api", onion()), None));
-        let (u, creds) = esplora("https://me:s3cret@esplora.example/api").unwrap();
-        assert_eq!((u.as_str(), creds), ("https://esplora.example/api", Some(("me".into(), "s3cret".into()))));
+        let (u, creds) = rpc(&format!("{}:8332", onion())).unwrap();
+        assert_eq!((u, creds), (format!("http://{}:8332", onion()), None));
+        let (u, creds) = rpc("https://me:s3cret@node.example").unwrap();
+        assert_eq!((u.as_str(), creds), ("https://node.example", Some(("me".into(), "s3cret".into()))));
         for (typed, why) in [
-            ("http://mempool.space/api", "plain http"),
+            ("http://node.example:8332", "plain http"),
             ("ftp://x.example", "https://host"),
             ("https://:pw@x.example", "user name"),
-            ("http://expyuzz4wqqyqhjn.onion/api", "v3"),
+            ("http://expyuzz4wqqyqhjn.onion:8332", "v3"),
         ] {
-            let e = esplora(typed).unwrap_err();
+            let e = rpc(typed).unwrap_err();
             assert!(e.contains(why), "{typed}: {e}");
         }
     }

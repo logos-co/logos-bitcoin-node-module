@@ -15,6 +15,7 @@ pub enum Kind {
     /// Kyoto's Bitcoin peers, from the curated list or the user's own.
     Kyoto,
     Electrum,
+    /// Only in files from before store version 4, which loading migrates; refused everywhere else.
     Esplora,
     Rpc,
     /// The node bitcoind_module runs in-process (stage 2), over Logos IPC.
@@ -23,7 +24,7 @@ pub enum Kind {
 
 impl Kind {
     pub fn is_server(self) -> bool {
-        matches!(self, Kind::Electrum | Kind::Esplora | Kind::Rpc)
+        matches!(self, Kind::Electrum | Kind::Rpc)
     }
 }
 
@@ -49,7 +50,7 @@ pub struct Source {
     pub history: bool,
     /// Reached through Tor. Onion services always are; the user's network never is.
     pub tor: bool,
-    /// Esplora's HTTP basic auth. Stored, never read back but by the wallet core.
+    /// RPC's HTTP basic auth. Stored, never read back but by the wallet core.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<Credentials>,
     /// The SHA-256 of the server's end-entity certificate, 64 lowercase hex characters, pinned
@@ -66,6 +67,7 @@ pub const LOCAL_ID: &str = "local";
 pub const LOCAL_URL: &str = "logos://bitcoind_module";
 pub const LOCAL_OPERATOR: &str = "local";
 pub const MAX_SOURCES: usize = 32;
+pub const ESPLORA_GONE: &str = "Esplora servers are no longer supported; use an Electrum server";
 
 /// The url as stored, and any credentials it carried.
 pub fn normalize_url(kind: Kind, url: &str) -> Result<(String, Option<Credentials>), String> {
@@ -75,8 +77,9 @@ pub fn normalize_url(kind: Kind, url: &str) -> Result<(String, Option<Credential
         (Kind::Local, "" | LOCAL_URL) => Ok((LOCAL_URL.into(), None)),
         (Kind::Local, u) => Err(format!("{u}: the local node's address is {LOCAL_URL}")),
         (Kind::Electrum, u) => Ok((addr::electrum(u)?, None)),
-        (Kind::Esplora | Kind::Rpc, u) => {
-            let (url, creds) = addr::esplora(u)?;
+        (Kind::Esplora, _) => Err(format!("{INVALID}{ESPLORA_GONE}")),
+        (Kind::Rpc, u) => {
+            let (url, creds) = addr::rpc(u)?;
             Ok((url, creds.map(|(username, password)| Credentials { username, password })))
         }
     }
@@ -89,7 +92,7 @@ pub fn host(s: &Source) -> String {
 
 /// A server reached over TLS, the only kind a certificate pin applies to.
 pub fn tls_server(kind: Kind, url: &str) -> bool {
-    (kind == Kind::Electrum && url.starts_with("ssl://")) || (matches!(kind, Kind::Esplora | Kind::Rpc) && url.starts_with("https://"))
+    (kind == Kind::Electrum && url.starts_with("ssl://")) || (kind == Kind::Rpc && url.starts_with("https://"))
 }
 
 /// A pin as stored: 64 lowercase hex characters. Colons are allowed in, as the wallet core reads it.
@@ -138,8 +141,8 @@ pub fn validate(list: &[Source]) -> Result<(), String> {
     if list.len() > MAX_SOURCES {
         return Err(format!("a list holds at most {MAX_SOURCES} sources"));
     }
-    if list.iter().filter(|s| s.enabled && s.kind == Kind::Rpc).count() > 1 {
-        return Err("Enable only one Bitcoin Core RPC endpoint at a time".into());
+    if list.iter().filter(|s| s.enabled && matches!(s.kind, Kind::Local | Kind::Rpc)).count() > 1 {
+        return Err("Enable only one node at a time: the local node or one Bitcoin Core RPC endpoint".into());
     }
     let (mut ids, mut urls) = (HashSet::new(), HashSet::new());
     for s in list {
@@ -166,8 +169,8 @@ pub fn validate(list: &[Source]) -> Result<(), String> {
         if !text_ok(&s.label, 128) {
             return Err(format!("{}: label is longer than 128 characters", s.id));
         }
-        if s.history && !matches!(s.kind, Kind::Electrum | Kind::Esplora) {
-            return Err(format!("{}: only Electrum and Esplora servers are asked about addresses", s.id));
+        if s.history && s.kind != Kind::Electrum {
+            return Err(format!("{}: only Electrum servers are asked about addresses", s.id));
         }
         if !s.tor && is_onion(&host(s)) {
             return Err(format!("{}: an onion service is reached through Tor only", s.id));
@@ -184,8 +187,8 @@ pub fn validate(list: &[Source]) -> Result<(), String> {
             }
         }
         if let Some(c) = &s.credentials {
-            if !matches!(s.kind, Kind::Esplora | Kind::Rpc) {
-                return Err(format!("{}: only Esplora and RPC servers take credentials", s.id));
+            if s.kind != Kind::Rpc {
+                return Err(format!("{}: only RPC servers take credentials", s.id));
             }
             if c.username.is_empty() || !text_ok(&c.username, 256) || !text_ok(&c.password, 256) || c.username.contains(':') {
                 return Err(format!("{}: credentials need a user name without ':', each at most 256 characters", s.id));
@@ -232,49 +235,54 @@ struct Seed {
     operator: &'static str,
     label: &'static str,
     on: bool,
+    pin: Option<&'static str>,
 }
 
 const fn seed(id: &'static str, kind: Kind, url: &'static str, operator: &'static str, label: &'static str, on: bool) -> Seed {
-    Seed { id, kind, url, operator, label, on }
+    Seed { id, kind, url, operator, label, on, pin: None }
 }
 
-/// The onion services in the defaults, from where each is published: blockstream.info's and
-/// mempool.space's Onion-Location headers and Blockstream's own server.features (2026-10-10), and
-/// for testnet4 Electrum's own server list, electrum/chains/testnet4/servers.json (2026-10-11).
-pub const VERIFIED_ONIONS: [&str; 3] = [
+impl Seed {
+    /// A self-signed server, shipped with its certificate's SHA-256.
+    const fn pinned(self, pin: &'static str) -> Seed {
+        Seed { pin: Some(pin), ..self }
+    }
+}
+
+/// The onion services in the defaults, from where each is published: blockstream.info's
+/// Onion-Location header and Blockstream's own server.features (2026-10-10), and for testnet4
+/// Electrum's own server list, electrum/chains/testnet4/servers.json (2026-10-11).
+pub const VERIFIED_ONIONS: [&str; 2] = [
     "explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion",
-    "mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion",
     "gsw6sn27quwf6u3swgra6o7lrp5qau6kt3ymuyoxgkth6wntzm2bjwyd.onion",
 ];
 
-// The one enabled server gives fee rates only (history off). The rest stay off until switched on.
+// The one enabled server gives fee rates only (history off); it answered 7 of 8 probes over Tor
+// (2026-11-03), missing only a 2,016-header batch, which a fee server is never asked for.
 const MAINNET: &[Seed] = &[
-    seed("blockstream.info-onion", Kind::Esplora, "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/api", "blockstream.info", "Blockstream Esplora (onion)", true),
-    seed("blockstream.info", Kind::Esplora, "https://blockstream.info/api", "blockstream.info", "Blockstream Esplora", false),
-    seed("mempool.space-onion", Kind::Esplora, "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api", "mempool.space", "mempool.space (onion)", false),
-    seed("mempool.space", Kind::Esplora, "https://mempool.space/api", "mempool.space", "mempool.space", false),
-    seed("electrum.blockstream.info-onion", Kind::Electrum, "tcp://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion:110", "blockstream.info", "Blockstream Electrum (onion)", false),
+    seed("electrum.blockstream.info-onion", Kind::Electrum, "tcp://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion:110", "blockstream.info", "Blockstream Electrum (onion)", true),
     seed("electrum.blockstream.info", Kind::Electrum, "ssl://electrum.blockstream.info:50002", "blockstream.info", "Blockstream Electrum", false),
-    seed("publicnode-rpc", Kind::Rpc, "https://bitcoin-rpc.publicnode.com", "publicnode.com", "PublicNode", false),
 ];
 
-// Testnet4 has no working Esplora over Tor (2026-10-11): Electrum servers that answered 3 of 3
-// probes, each on a fresh circuit, with a certificate the web PKI trusts or over an onion service.
+// Electrum servers that answered 3 of 3 probes (2026-10-11), each on a fresh circuit, with a
+// certificate the web PKI trusts or over an onion service.
 const TESTNET4: &[Seed] = &[
     seed("electrum-testnet4-onion", Kind::Electrum, "tcp://gsw6sn27quwf6u3swgra6o7lrp5qau6kt3ymuyoxgkth6wntzm2bjwyd.onion:52001", "gsw6sn27quwf6u3swgra6o7lrp5qau6kt3ymuyoxgkth6wntzm2bjwyd.onion", "Electrum testnet4 (onion)", true),
     seed("bitcoin.stagemole.eu", Kind::Electrum, "ssl://bitcoin.stagemole.eu:5010", "stagemole.eu", "stagemole.eu Electrum", false),
     seed("blackie.c3-soft.com", Kind::Electrum, "ssl://blackie.c3-soft.com:57010", "c3-soft.com", "c3-soft.com Electrum", false),
 ];
 
+// Self-signed ElectrumX servers that answered 8 of 8 probes over Tor with these pins (2026-11-03).
+// Defaults on are web-PKI-trusted or onion services; these keep that rule by shipping off.
 const SIGNET: &[Seed] = &[
-    seed("blockstream.info-onion", Kind::Esplora, "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/signet/api", "blockstream.info", "Blockstream Esplora (onion)", true),
-    seed("blockstream.info", Kind::Esplora, "https://blockstream.info/signet/api", "blockstream.info", "Blockstream Esplora", false),
-    seed("mempool.space-onion", Kind::Esplora, "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/signet/api", "mempool.space", "mempool.space (onion)", false),
-    seed("mempool.space", Kind::Esplora, "https://mempool.space/signet/api", "mempool.space", "mempool.space", false),
+    seed("electrum.emzy.de", Kind::Electrum, "ssl://electrum.emzy.de:53002", "emzy.de", "emzy.de Electrum", false)
+        .pinned("ae52a2307cb9878024b61dbf948d3aac8fea705dfefe562cc62191b6995c48cc"),
+    seed("signet-electrumx.wakiyamap.dev", Kind::Electrum, "ssl://signet-electrumx.wakiyamap.dev:50002", "wakiyamap.dev", "wakiyamap.dev Electrum", false)
+        .pinned("aeef7989269830a269c15c841e68bee776e1a15b208804418762471cd1ccce85"),
 ];
 
-/// Kyoto on, one Esplora server for fee rates, every other source off. Regtest has no public
-/// servers: its sources are the user's own.
+/// Kyoto on, one Electrum server for fee rates, every other source off. Signet runs Kyoto alone,
+/// its fee the relay floor. Regtest has no public servers: its sources are the user's own.
 pub fn defaults(net: BNetwork) -> Vec<Source> {
     let seeds: &[Seed] = match net {
         BNetwork::Mainnet => MAINNET,
@@ -291,9 +299,9 @@ pub fn defaults(net: BNetwork) -> Vec<Source> {
         label: s.label.into(),
         enabled: s.on,
         history: false,
-        tor: s.kind != Kind::Rpc,
+        tor: true,
         credentials: None,
-        cert_sha256: None,
+        cert_sha256: s.pin.map(String::from),
     }));
     out.push(local(false));
     out
@@ -473,16 +481,6 @@ pub struct Roles {
     pub fees: Vec<RouteEntry>,
     pub broadcast: Vec<RouteEntry>,
     pub check: Vec<RouteEntry>,
-    pub cross_check: bool,
-}
-
-/// Distinct operators: Kyoto's many peers count as one, as does the user's local node.
-fn operator_key(e: &RouteEntry) -> String {
-    match e.kind {
-        Kind::Kyoto => "kyoto:".into(),
-        Kind::Local => "local:".into(),
-        _ => e.operator.to_ascii_lowercase(),
-    }
 }
 
 /// The roles over the enabled sources `usable` admits, in failover order (README, Routes). The
@@ -501,20 +499,17 @@ pub fn roles(list: &[Source], route: impl Fn(&Source) -> Route, usable: impl Fn(
     };
     let pick = |keep: &dyn Fn(&Source) -> bool| -> Vec<RouteEntry> { list.iter().filter(|s| on(s) && keep(s)).map(&entry).collect() };
     let authority = list.iter().any(|s| s.enabled && matches!(s.kind, Kind::Local | Kind::Rpc | Kind::Kyoto));
-    let (local, kyoto) = (pick(&|s| s.kind == Kind::Local), pick(&|s| s.kind == Kind::Kyoto));
-    let rpc = pick(&|s| s.kind == Kind::Rpc);
-    let servers = pick(&|s| matches!(s.kind, Kind::Electrum | Kind::Esplora));
-    let history_servers = pick(&|s| s.kind.is_server() && s.history);
+    let (node, kyoto) = (pick(&|s| matches!(s.kind, Kind::Local | Kind::Rpc)), pick(&|s| s.kind == Kind::Kyoto));
+    let servers = pick(&|s| s.kind == Kind::Electrum);
+    let history_servers = pick(&|s| s.kind == Kind::Electrum && s.history);
     let cat = |parts: &[&Vec<RouteEntry>]| parts.iter().flat_map(|p| p.iter().cloned()).collect::<Vec<_>>();
-    let chain = if authority { cat(&[&local, &rpc, &kyoto]) } else { pick(&|s| s.kind == Kind::Electrum) };
-    let broadcast = if authority { cat(&[&local, &rpc, &kyoto]) } else { history_servers.clone() };
-    let operators: HashSet<String> = chain.iter().chain(servers.iter()).map(operator_key).collect();
+    let chain = if authority { cat(&[&node, &kyoto]) } else { servers.clone() };
+    let broadcast = if authority { cat(&[&node, &kyoto]) } else { history_servers.clone() };
     Roles {
-        history: cat(&[&local, &rpc, &kyoto, &history_servers]),
-        pending: cat(&[&local, &rpc, &history_servers]),
-        fees: cat(&[&local, &rpc, &servers, &kyoto]),
-        check: servers.clone(),
-        cross_check: operators.len() >= 2,
+        history: cat(&[&node, &kyoto, &history_servers]),
+        pending: cat(&[&node, &history_servers]),
+        fees: cat(&[&node, &servers, &kyoto]),
+        check: servers,
         chain,
         broadcast,
     }
@@ -581,12 +576,13 @@ mod tests {
             validate(&list).unwrap();
             let on: Vec<&Source> = list.iter().filter(|s| s.enabled).collect();
             assert_eq!(on[0].id, KYOTO_ID, "{net:?}");
-            assert!(list.iter().all(|s| !s.history && (s.tor || matches!(s.kind, Kind::Local | Kind::Rpc))), "{net:?}");
+            assert!(list.iter().all(|s| !s.history && (s.tor || s.kind == Kind::Local)), "{net:?}");
+            assert!(list.iter().all(|s| matches!(s.kind, Kind::Kyoto | Kind::Electrum | Kind::Local)), "{net:?}");
             let fee: Vec<&&Source> = on.iter().filter(|s| s.kind.is_server()).collect();
-            assert_eq!(fee.len(), usize::from(net != BNetwork::Regtest), "{net:?}: one fee server");
-            // Testnet4 has no Esplora that answers over Tor; its fee server is an Electrum onion.
-            let kind = if net == BNetwork::Testnet4 { Kind::Electrum } else { Kind::Esplora };
-            assert!(fee.iter().all(|s| s.kind == kind && is_onion(&host(s))), "{net:?}");
+            let fee_server = matches!(net, BNetwork::Mainnet | BNetwork::Testnet4);
+            assert_eq!(fee.len(), usize::from(fee_server), "{net:?}: one fee server, none on signet");
+            assert!(fee.iter().all(|s| is_onion(&host(s))), "{net:?}");
+            assert!(on.iter().all(|s| s.cert_sha256.is_none()), "{net:?}: a pinned server ships off");
             assert_eq!(list.last().unwrap().id, LOCAL_ID);
             assert!(!list.last().unwrap().enabled);
             let r = roles(&list, server_route, all);
@@ -594,12 +590,18 @@ mod tests {
             assert!(exposes(&list, lan).is_empty() && without_tor(&list, server_route, lan).is_empty());
         }
         let main = defaults(BNetwork::Mainnet);
-        let fee = main.iter().find(|s| s.enabled && s.kind.is_server()).unwrap();
-        assert!(is_onion(&host(fee)) && fee.url.ends_with("/api"));
         let r = roles(&main, server_route, all);
-        assert_eq!((ids(&r.chain), ids(&r.fees), ids(&r.check)), (vec!["kyoto"], vec![fee.id.as_str(), "kyoto"], vec![fee.id.as_str()]));
+        let fee = "electrum.blockstream.info-onion";
+        assert_eq!((ids(&r.chain), ids(&r.fees), ids(&r.check)), (vec!["kyoto"], vec![fee, "kyoto"], vec![fee]));
         assert_eq!(ids(&r.broadcast), ["kyoto"]);
-        assert!(r.cross_check, "Kyoto's peers and the fee server's operator");
+        let signet = defaults(BNetwork::Signet);
+        let pinned: Vec<(&str, Option<&str>)> = signet.iter().filter(|s| s.kind.is_server()).map(|s| (s.id.as_str(), s.cert_sha256.as_deref())).collect();
+        assert_eq!(pinned, [
+            ("electrum.emzy.de", Some("ae52a2307cb9878024b61dbf948d3aac8fea705dfefe562cc62191b6995c48cc")),
+            ("signet-electrumx.wakiyamap.dev", Some("aeef7989269830a269c15c841e68bee776e1a15b208804418762471cd1ccce85")),
+        ]);
+        let r = roles(&signet, server_route, all);
+        assert_eq!((ids(&r.chain), ids(&r.fees), r.check.len()), (vec!["kyoto"], vec!["kyoto"], 0), "Kyoto alone");
     }
 
     #[test]
@@ -615,9 +617,7 @@ mod tests {
     #[test]
     fn the_chain_follows_what_is_switched_on() {
         let mut list = defaults(BNetwork::Mainnet);
-        for s in list.iter_mut() {
-            s.enabled = s.kind != Kind::Rpc;
-        }
+        list.iter_mut().for_each(|s| s.enabled = true);
         let r = roles(&list, server_route, all);
         assert_eq!(ids(&r.chain), ["local", "kyoto"]);
         assert_eq!(ids(&r.broadcast), ["local", "kyoto"]);
@@ -627,15 +627,13 @@ mod tests {
         assert!(r.chain.is_empty() && r.broadcast.is_empty());
         // Kyoto and the node off: every Electrum server, and history servers broadcast.
         list.iter_mut().filter(|s| !s.kind.is_server()).for_each(|s| s.enabled = false);
-        list.iter_mut().filter(|s| s.id == "blockstream.info").for_each(|s| s.history = true);
+        list.iter_mut().filter(|s| s.id == "electrum.blockstream.info").for_each(|s| s.history = true);
         let r = roles(&list, server_route, all);
         assert_eq!(ids(&r.chain), ["electrum.blockstream.info-onion", "electrum.blockstream.info"]);
-        assert_eq!((ids(&r.history), ids(&r.broadcast)), (vec!["blockstream.info"], vec!["blockstream.info"]));
-        assert_eq!(r.check.len(), 6);
-        assert!(r.cross_check, "blockstream.info and mempool.space");
-        // One operator alone: no cross-check.
-        list.retain(|s| s.operator == "blockstream.info");
-        assert!(!roles(&list, server_route, all).cross_check);
+        assert_eq!((ids(&r.history), ids(&r.broadcast)), (vec!["electrum.blockstream.info"], vec!["electrum.blockstream.info"]));
+        assert_eq!(r.check.len(), 2);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["broadcast", "chain", "check", "fees", "history", "pending"], "no crossCheck");
     }
 
     #[test]
@@ -643,13 +641,13 @@ mod tests {
         let mut list = defaults(BNetwork::Signet);
         let home = r#"[{"id":"home","kind":"electrum","url":"192.168.1.20","history":true}]"#;
         list.extend(parse_list(home, &[]).unwrap());
-        for s in list.iter_mut().filter(|s| s.id == "blockstream.info") {
+        for s in list.iter_mut().filter(|s| s.id == "electrum.emzy.de") {
             (s.enabled, s.history, s.tor) = (true, true, false);
         }
         let ex = exposes(&list, lan);
-        assert_eq!(ex.iter().map(|n| (n.id.as_str(), n.lan)).collect::<Vec<_>>(), [("blockstream.info", false), ("home", true)]);
+        assert_eq!(ex.iter().map(|n| (n.id.as_str(), n.lan)).collect::<Vec<_>>(), [("electrum.emzy.de", false), ("home", true)]);
         let direct = without_tor(&list, server_route, lan);
-        assert_eq!(direct.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["blockstream.info"], "the LAN server is not listed");
+        assert_eq!(direct.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["electrum.emzy.de"], "the LAN server is not listed");
     }
 
     #[test]
@@ -657,31 +655,33 @@ mod tests {
         let list = parse_list(
             r#"[{"id":"kyoto","kind":"kyoto"},
                 {"id":"e1","kind":"electrum","url":"Electrum.Example.COM"},
-                {"id":"x","kind":"esplora","url":"https://u:p@esplora.example/api","use":false,"label":" Mine "},
+                {"id":"x","kind":"rpc","url":"https://u:p@node.example/rpc","use":false,"label":" Mine "},
                 {"id":"local","kind":"local","lan":true,"route":"direct","hasCredentials":false}]"#,
             &[],
         )
         .unwrap();
         assert_eq!(list[0], kyoto(true));
         assert_eq!((list[1].url.as_str(), list[1].operator.as_str(), list[1].label.as_str()), ("ssl://electrum.example.com:50002", "example.com", "electrum.example.com"));
-        assert_eq!((list[2].url.as_str(), list[2].label.as_str(), list[2].enabled), ("https://esplora.example/api", "Mine", false));
+        assert_eq!((list[2].url.as_str(), list[2].label.as_str(), list[2].enabled), ("https://node.example/rpc", "Mine", false));
         assert_eq!(list[2].credentials, Some(Credentials { username: "u".into(), password: "p".into() }));
         assert_eq!(list[3], local(true));
 
         // Credentials survive a round trip that leaves them out, and go with null or a new url.
-        let back = r#"[{"id":"x","kind":"esplora","url":"https://esplora.example/api"}]"#;
+        let back = r#"[{"id":"x","kind":"rpc","url":"https://node.example/rpc"}]"#;
         assert!(parse_list(back, &list).unwrap()[0].credentials.is_some());
-        let cleared = r#"[{"id":"x","kind":"esplora","url":"https://esplora.example/api","credentials":null}]"#;
+        let cleared = r#"[{"id":"x","kind":"rpc","url":"https://node.example/rpc","credentials":null}]"#;
         assert!(parse_list(cleared, &list).unwrap()[0].credentials.is_none());
-        let moved = r#"[{"id":"x","kind":"esplora","url":"https://other.example/api"}]"#;
+        let moved = r#"[{"id":"x","kind":"rpc","url":"https://other.example/rpc"}]"#;
         assert!(parse_list(moved, &list).unwrap()[0].credentials.is_none());
-        let apart = r#"[{"id":"x","kind":"esplora","url":"https://esplora.example/api","credentials":{"username":"a","password":"b"}}]"#;
+        let apart = r#"[{"id":"x","kind":"rpc","url":"https://node.example/rpc","credentials":{"username":"a","password":"b"}}]"#;
         assert_eq!(parse_list(apart, &[]).unwrap()[0].credentials.as_ref().unwrap().username, "a");
 
         let onion = format!("{}.onion", "a2".repeat(28));
         for (bad, why) in [
             (r#"[{"id":"a","kind":"electrum","url":"tcp://electrum.example:50001"}]"#.to_string(), "plain tcp"),
-            (r#"[{"id":"a","kind":"esplora","url":"http://esplora.example"}]"#.into(), "plain http"),
+            (r#"[{"id":"a","kind":"rpc","url":"http://node.example"}]"#.into(), "plain http"),
+            (r#"[{"id":"a","kind":"esplora","url":"https://esplora.example/api"}]"#.into(), "invalid parameters: a: Esplora servers are no longer supported; use an Electrum server"),
+            (r#"[{"id":"a","kind":"esplora"}]"#.into(), ESPLORA_GONE),
             (r#"[{"id":"a","kind":"electrum","url":"x.example"},{"id":"a","kind":"electrum","url":"y.example"}]"#.into(), "duplicate source id"),
             (r#"[{"id":"a","kind":"electrum","url":"x.example"},{"id":"b","kind":"electrum","url":"ssl://x.example:50002"}]"#.into(), "duplicate source url"),
             (r#"[{"id":"kyoto","kind":"electrum","url":"x.example"}]"#.into(), "belong to Kyoto"),
@@ -689,9 +689,10 @@ mod tests {
             (r#"[{"id":"kyoto","kind":"kyoto","url":"192.168.1.20:8333"}]"#.into(), "peer list"),
             (r#"[{"id":"kyoto","kind":"kyoto","history":true}]"#.into(), "asked about addresses"),
             (r#"[{"id":"local","kind":"local","tor":true}]"#.into(), "Logos IPC"),
-            (format!(r#"[{{"id":"o","kind":"esplora","url":"http://{onion}/api","tor":false}}]"#), "through Tor only"),
-            (r#"[{"id":"a","kind":"electrum","url":"x.example","credentials":{"username":"u","password":"p"}}]"#.into(), "only Esplora"),
-            (r#"[{"id":"a","kind":"esplora","url":"https://u:p@x.example","credentials":{"username":"u","password":"p"}}]"#.into(), "given twice"),
+            (format!(r#"[{{"id":"o","kind":"rpc","url":"http://{onion}","tor":false}}]"#), "through Tor only"),
+            (r#"[{"id":"a","kind":"electrum","url":"x.example","credentials":{"username":"u","password":"p"}}]"#.into(), "only RPC servers"),
+            (r#"[{"id":"a","kind":"electrum","url":"x.example","history":true},{"id":"b","kind":"rpc","url":"https://y.example","history":true}]"#.into(), "only Electrum servers are asked"),
+            (r#"[{"id":"a","kind":"rpc","url":"https://u:p@x.example","credentials":{"username":"u","password":"p"}}]"#.into(), "given twice"),
             (r#"[{"id":"a b","kind":"electrum","url":"x.example"}]"#.into(), "bad source id"),
             (r#"[{"id":"a","kind":"electrum","url":"x.example","enable":true}]"#.into(), "source list"),
             (r#"[{"id":"a","kind":"nostr","url":"x.example"}]"#.into(), "source list"),
@@ -719,9 +720,9 @@ mod tests {
         assert_eq!(parse_list(&one(r#","certSha256":null"#), &parsed).unwrap()[0].cert_sha256, None, "null clears it");
         let moved = parse_list(r#"[{"id":"mine","kind":"electrum","url":"ssl://other.example:50002"}]"#, &parsed).unwrap();
         assert_eq!(moved[0].cert_sha256, None, "not carried to another url");
-        let esplora = format!(r#"[{{"id":"e","kind":"esplora","url":"https://esplora.example/api","certSha256":"{pin}"}}]"#);
-        assert_eq!(parse_list(&esplora, &[]).unwrap()[0].cert_sha256.as_deref(), Some(pin.as_str()));
-        for (kind, url) in [("electrum", "tcp://192.168.1.20:50001"), ("esplora", "http://192.168.1.20:3002/api")] {
+        let rpc = format!(r#"[{{"id":"e","kind":"rpc","url":"https://node.example","certSha256":"{pin}"}}]"#);
+        assert_eq!(parse_list(&rpc, &[]).unwrap()[0].cert_sha256.as_deref(), Some(pin.as_str()));
+        for (kind, url) in [("electrum", "tcp://192.168.1.20:50001"), ("rpc", "http://192.168.1.20:8332")] {
             let l = format!(r#"[{{"id":"x","kind":"{kind}","url":"{url}","certSha256":"{pin}"}}]"#);
             let e = parse_list(&l, &[]).unwrap_err();
             assert!(e.starts_with("invalid parameters: x: certSha256 is for a server reached over TLS"), "{e}");
@@ -747,15 +748,15 @@ mod tests {
     #[test]
     fn plain_text_only_to_onion_services_and_your_network() {
         let onion = format!("{}.onion", "a2".repeat(28));
-        for (kind, url) in [("electrum", "tcp://electrum.example:50001"), ("esplora", "http://mempool.space/api")] {
+        for (kind, url) in [("electrum", "tcp://electrum.example:50001"), ("rpc", "http://node.example:8332")] {
             let e = parse_list(&format!(r#"[{{"id":"x","kind":"{kind}","url":"{url}"}}]"#), &[]).unwrap_err();
             assert!(e.starts_with("invalid parameters: x: ") && e.contains("plain"), "{e}");
         }
         let fine = [
             ("electrum", "tcp://192.168.1.20:50001".to_string()),
             ("electrum", format!("tcp://{onion}:50001")),
-            ("esplora", "http://umbrel.local/api".to_string()),
-            ("esplora", format!("http://{onion}/api")),
+            ("rpc", "http://umbrel.local:8332".to_string()),
+            ("rpc", format!("http://{onion}")),
         ];
         for (kind, url) in fine {
             assert!(parse_list(&format!(r#"[{{"id":"x","kind":"{kind}","url":"{url}"}}]"#), &[]).is_ok(), "{url}");
@@ -770,12 +771,17 @@ mod tests {
         let r = roles(&list, |_| Route::Tor, |_| true);
         let mine = r.check.iter().find(|e| e.id == "mine").unwrap();
         assert_eq!((mine.cert_sha256.as_deref(), mine.user_added), (Some(pin.as_str()), true));
-        let theirs = r.fees.iter().find(|e| e.id == "blockstream.info-onion").unwrap();
+        let theirs = r.fees.iter().find(|e| e.id == "electrum.blockstream.info-onion").unwrap();
         assert_eq!((theirs.cert_sha256.as_deref(), theirs.user_added), (None, false), "a default");
         let v = serde_json::to_value(mine).unwrap();
         assert_eq!((&v["certSha256"], &v["userAdded"]), (&serde_json::json!(pin), &serde_json::json!(true)));
         let v = serde_json::to_value(theirs).unwrap();
         assert!(v.get("userAdded").is_none() && v.get("certSha256").is_none(), "left out when unset");
+        // A pinned default, switched on, carries its pin and is still a default.
+        let mut signet = defaults(BNetwork::Signet);
+        signet.iter_mut().filter(|s| s.id == "electrum.emzy.de").for_each(|s| s.enabled = true);
+        let r = roles(&signet, |_| Route::Tor, |_| true);
+        assert_eq!((r.check[0].id.as_str(), r.check[0].cert_sha256.as_deref().map(str::len), r.check[0].user_added), ("electrum.emzy.de", Some(64), false));
     }
 
     #[test]
@@ -803,8 +809,20 @@ mod rpc_tests {
         assert!(roles.check.is_empty());
         let preserved=parse_list(r#"[{"id":"rpc","kind":"rpc","url":"http://127.0.0.1:8332","tor":false}]"#,&list).unwrap();
         assert_eq!(preserved[0].credentials,list[0].credentials);
-        assert!(parse_list(r#"[{"id":"a","kind":"rpc","url":"https://one.example"},{"id":"b","kind":"rpc","url":"https://two.example"}]"#,&[]).is_err());
         assert!(parse_list(r#"[{"id":"rpc","kind":"rpc","url":"http://public.example:8332"}]"#,&[]).is_err());
         assert!(parse_list(r#"[{"id":"rpc","kind":"rpc","url":"https://public.example","history":true}]"#,&[]).is_err());
+    }
+
+    #[test]
+    fn at_most_one_node_source_is_on() {
+        let one = "Enable only one node at a time: the local node or one Bitcoin Core RPC endpoint";
+        for two in [
+            r#"[{"id":"a","kind":"rpc","url":"https://one.example"},{"id":"b","kind":"rpc","url":"https://two.example"}]"#,
+            r#"[{"id":"local","kind":"local"},{"id":"b","kind":"rpc","url":"https://two.example"}]"#,
+        ] {
+            assert_eq!(parse_list(two, &[]).unwrap_err(), one, "{two}");
+        }
+        let off = r#"[{"id":"local","kind":"local"},{"id":"a","kind":"rpc","url":"https://one.example","use":false},{"id":"b","kind":"rpc","url":"https://two.example","use":false}]"#;
+        assert_eq!(parse_list(off, &[]).unwrap().len(), 3, "a user's RPC entries stay, switched off");
     }
 }

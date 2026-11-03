@@ -64,7 +64,7 @@ pub async fn probe(
             );
         };
         Ok(Observed {
-            genesis: Some(genesis),
+            genesis,
             tip_height: u64::from(tip_height),
             tip_hash,
             rtt_ms,

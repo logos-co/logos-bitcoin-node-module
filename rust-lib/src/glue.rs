@@ -19,16 +19,17 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// `{ ok, state: unconfigured|unready|configured, configured, unconfigured, proxySet, walletOpen,
     /// torUse, torUseChosen }`.
     fn config_status(&self) -> String;
-    /// Fills what is absent: the Tor proxy, and each network's sources (Kyoto on, one Esplora
-    /// server for fee rates, every other source off). `{ ok, applied }`. Backend only.
+    /// Fills what is absent: the Tor proxy, and each network's sources (Kyoto on, one Electrum
+    /// server for fee rates but on signet, every other source off). `{ ok, applied }`. Backend only.
     fn init_defaults(&self) -> String;
     /// `{ ok, network, configured, walletOpen, proxy, torUse, torUseChosen, sources: [{ id, kind, url, operator, label, use,
-/// history, tor, lan, hasCredentials, certSha256, route, suspect }], exposes, withoutTor, crossCheck }`; no credential.
+/// history, tor, lan, hasCredentials, certSha256, route, suspect }], exposes, withoutTor }`; no credential.
     fn get_sources(&self, network: String) -> String;
     /// Replaces the list (a JSON array of sources); answers as get_sources. A source's
 /// `certSha256` (TLS servers only) is kept when absent and cleared by null. Plain tcp:// or
-/// http:// to a public host is refused with `invalid parameters: …`. Backend only; refused
-/// while a wallet is open on `network`.
+/// http:// to a public host, and an `esplora` entry, are refused with `invalid parameters: …`.
+/// At most one node (`local` or `rpc`) may be on. Backend only; refused while a wallet is open
+/// on `network`.
     fn set_sources(&self, network: String, list_json: String) -> String;
     /// Changes one source: `{ use?, history?, tor?, certSha256? }`. tor: false is refused for an
     /// onion service. certSha256 pins the server's end-entity certificate (64 hex characters,
@@ -46,7 +47,7 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     fn set_tor_use(&self, mode: String) -> String;
     /// Whether a wallet is open on `network`, which locks its settings. Backend only.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
-    /// `{ ok, network, proxy, chain, history, pending, fees, broadcast, check, peers, crossCheck, unrouted,
+    /// `{ ok, network, proxy, chain, history, pending, fees, broadcast, check, peers, unrouted,
 /// torUse, kyotoSplit }`, each role `[{ id, kind, url, operator, route: tor|direct|onion, credentials?,
 /// certSha256?, userAdded? }]`, `peers` `[{ peer: "host:port", source: list|learned|seed|own, ok,
 /// services? }]` (`ok`: it ever worked; `services` for clearnet peers). `kyotoSplit`, in
@@ -84,7 +85,7 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     fn probe(&self, network: String, source_id: String) -> String;
     /// `{ ok, network, enabled, available, status?, error? }` from bitcoind_module, when loaded.
     fn local_node(&self, network: String) -> String;
-    /// `{ ok, network, sourceId, username, password }` of an Esplora server. Wallet core only.
+    /// `{ ok, network, sourceId, username, password }` of an RPC server. Wallet core only.
     fn source_credentials(&self, network: String, source_id: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}

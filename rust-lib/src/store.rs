@@ -16,7 +16,15 @@ use crate::strnum::{de, de_opt, double_option, ser, ser_opt};
 
 pub const FILE_NAME: &str = "bitcoin_sources.json";
 /// 2: the proxy may be `tor`, the Tor that comes with Logos. 3: `torUse` and `torUseChosen`.
-pub const VERSION: u32 = 3;
+/// 4: no Esplora or PublicNode, and at most one node source on.
+pub const VERSION: u32 = 4;
+
+/// Version 3's mainnet Esplora seeds, and the same operator's Electrum entry each moves to.
+const ESPLORA_TO_ELECTRUM: [(&str, &str, &str); 2] = [
+    ("blockstream.info-onion", "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/api", "electrum.blockstream.info-onion"),
+    ("blockstream.info", "https://blockstream.info/api", "electrum.blockstream.info"),
+];
+const PUBLICNODE: (&str, &str) = ("publicnode-rpc", "https://bitcoin-rpc.publicnode.com");
 
 /// What Tor carries: everything, only what identifies the wallet, or nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +97,48 @@ impl NetConfig {
         self.suspects.retain(|id, _| url(&old, id).is_some() && url(&old, id) == url(&new, id));
     }
 
+    /// Version 4 (README, Store): Esplora and PublicNode go, local wins over RPC, and the new
+    /// default servers are added off. Pins and credentials stay with the entry they were set on.
+    fn upgrade_to_4(&mut self, net: BNetwork) {
+        let (mut esplora, mut public_on) = (Vec::new(), false);
+        self.sources.retain(|s| {
+            let public = (s.id.as_str(), s.url.as_str()) == PUBLICNODE;
+            public_on |= public && s.enabled;
+            if s.kind == Kind::Esplora {
+                esplora.push(s.clone());
+            }
+            !public && s.kind != Kind::Esplora
+        });
+        let on = |l: &[Source], kinds: &[Kind]| l.iter().any(|s| s.enabled && kinds.contains(&s.kind));
+        if on(&self.sources, &[Kind::Local]) {
+            self.sources.iter_mut().filter(|s| s.kind == Kind::Rpc).for_each(|s| s.enabled = false);
+        }
+        // PublicNode was the only chain source: "Use only this" had switched Kyoto off.
+        if public_on && !on(&self.sources, &[Kind::Local, Kind::Rpc, Kind::Kyoto]) {
+            self.sources.iter_mut().filter(|s| s.kind == Kind::Kyoto).for_each(|s| s.enabled = true);
+        }
+        for seed in sources::defaults(net).into_iter().filter(|d| d.kind.is_server()) {
+            if self.sources.len() < sources::MAX_SOURCES && !self.sources.iter().any(|s| s.id == seed.id || s.url == seed.url) {
+                let at = self.sources.iter().position(|s| s.kind == Kind::Local).unwrap_or(self.sources.len());
+                self.sources.insert(at, Source { enabled: false, ..seed });
+            }
+        }
+        // The default fee server moves over when on, any other only with history.
+        for e in esplora.iter().filter(|_| net == BNetwork::Mainnet) {
+            let Some(&(_, _, to)) = ESPLORA_TO_ELECTRUM.iter().find(|(id, url, _)| (e.id.as_str(), e.url.as_str()) == (*id, *url)) else { continue };
+            let Some(t) = self.sources.iter_mut().find(|s| s.id == to && !sources::user_added(s)) else { continue };
+            if e.history || (e.enabled && e.id == ESPLORA_TO_ELECTRUM[0].0) {
+                if !t.enabled {
+                    t.tor = e.tor;
+                }
+                t.enabled |= e.enabled;
+                t.history |= e.history;
+            }
+        }
+        let ids: Vec<String> = self.sources.iter().map(|s| s.id.clone()).collect();
+        self.suspects.retain(|id, _| ids.contains(id));
+    }
+
     pub fn validate(&self, net: BNetwork) -> Result<(), String> {
         sources::validate(&self.sources)?;
         if self.own_peers.len() > peers::MAX_OWN_PEERS {
@@ -156,6 +206,9 @@ impl Store {
         if self.version < 3 {
             (self.tor_use, self.tor_use_chosen) = (TorUse::All, false);
         }
+        if self.version < 4 {
+            self.networks.iter_mut().for_each(|(net, cfg)| cfg.upgrade_to_4(*net));
+        }
         self.version = VERSION;
     }
 
@@ -194,13 +247,6 @@ impl Store {
         store.networks.retain(|net, _| kept.contains(net));
         if let Err(e) = store.validate() {
             return Loaded::Corrupt(e);
-        }
-        // Catalog addition only: preserve every configured endpoint, credential and route.
-        if let Some(cfg) = store.networks.get_mut(&BNetwork::Mainnet) {
-            let preset = sources::defaults(BNetwork::Mainnet).into_iter().find(|s| s.id == "publicnode-rpc").expect("built-in RPC");
-            if !cfg.sources.iter().any(|s| s.id == preset.id || s.url.trim_end_matches('/') == preset.url) {
-                cfg.sources.push(preset);
-            }
         }
         if store.salt.len() != 32 || !store.salt.bytes().all(|b| b.is_ascii_hexdigit()) {
             store.salt = fresh_salt();
@@ -273,33 +319,190 @@ mod tests {
         s
     }
 
-    #[test]
-    fn publicnode_migration_is_disabled_and_preserves_custom_settings() {
+    fn esplora(id: &str, url: &str, operator: &str, on: bool) -> Source {
+        Source { id: id.into(), kind: Kind::Esplora, url: url.into(), operator: operator.into(), label: id.into(), enabled: on, history: false, tor: true, credentials: None, cert_sha256: None }
+    }
+
+    fn rpc(id: &str, url: &str, on: bool) -> Source {
+        Source { id: id.into(), kind: Kind::Rpc, url: url.into(), operator: "node".into(), label: id.into(), enabled: on, history: false, tor: false, credentials: None, cert_sha256: None }
+    }
+
+    const MEMPOOL_ONION: &str = "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion";
+
+    /// A version 3 store with that version's defaults: Esplora fee servers on mainnet and signet.
+    fn version_3() -> Store {
+        let mut s = configured();
+        s.version = 3;
+        let (onion, bi) = (ESPLORA_TO_ELECTRUM[0].1, ESPLORA_TO_ELECTRUM[1].1);
+        let electrum: Vec<Source> = sources::defaults(BNetwork::Mainnet).into_iter().filter(|s| s.kind == Kind::Electrum).map(|s| Source { enabled: false, ..s }).collect();
+        let mut main = vec![sources::kyoto(true), esplora("blockstream.info-onion", onion, "blockstream.info", true), esplora("blockstream.info", bi, "blockstream.info", false)];
+        main.push(esplora("mempool.space-onion", &format!("{MEMPOOL_ONION}/api"), "mempool.space", false));
+        main.push(esplora("mempool.space", "https://mempool.space/api", "mempool.space", false));
+        main.extend(electrum);
+        main.extend([rpc(PUBLICNODE.0, PUBLICNODE.1, false), sources::local(false)]);
+        s.networks.get_mut(&BNetwork::Mainnet).unwrap().sources = main;
+        let signet = onion.replace("/api", "/signet/api");
+        s.networks.get_mut(&BNetwork::Signet).unwrap().sources = vec![
+            sources::kyoto(true),
+            esplora("blockstream.info-onion", &signet, "blockstream.info", true),
+            esplora("blockstream.info", "https://blockstream.info/signet/api", "blockstream.info", false),
+            esplora("mempool.space-onion", &format!("{MEMPOOL_ONION}/signet/api"), "mempool.space", false),
+            esplora("mempool.space", "https://mempool.space/signet/api", "mempool.space", false),
+            sources::local(false),
+        ];
+        s
+    }
+
+    /// Saves `old`, loads it, and checks the file keeps its version until the next save.
+    fn upgraded(old: &Store) -> Store {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
-        let mut old = configured();
-        let main = old.networks.get_mut(&BNetwork::Mainnet).unwrap();
-        main.sources.retain(|s| s.id != "publicnode-rpc");
-        main.sources[2].credentials = Some(Credentials { username: "user".into(), password: "pass".into() });
-        main.sources[2].tor = false;
-        let previous = main.sources.clone();
         old.save(&path).unwrap();
-        let Loaded::Found(mut updated) = Store::load(&path) else { panic!() };
-        let sources = &updated.networks[&BNetwork::Mainnet].sources;
-        assert_eq!(&sources[..previous.len()], &previous);
-        let rpc = sources.last().unwrap();
-        assert_eq!(rpc.id, "publicnode-rpc");
-        assert!(!rpc.enabled && !rpc.history && !rpc.tor);
-        assert!(updated.networks[&BNetwork::Signet].sources.iter().all(|s| s.id != "publicnode-rpc"));
-        updated.save(&path).unwrap();
+        let Loaded::Found(up) = Store::load(&path) else { panic!("set aside") };
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&format!("\"version\": {}", old.version)), "an older build still reads it");
+        assert_eq!(up.version, VERSION);
+        up.save(&path).unwrap();
         let Loaded::Found(again) = Store::load(&path) else { panic!() };
-        assert_eq!(again, updated);
-        // Someone already entered this URL: retain their name, credentials and Tor choice.
-        let rpc = updated.networks.get_mut(&BNetwork::Mainnet).unwrap().sources.last_mut().unwrap();
-        rpc.id = "my-publicnode".into(); rpc.tor = true; rpc.enabled = true;
-        updated.save(&path).unwrap();
-        let Loaded::Found(again) = Store::load(&path) else { panic!() };
-        assert_eq!(again, updated);
+        assert_eq!(again, up);
+        up
+    }
+
+    fn net(s: &mut Store, n: BNetwork) -> &mut NetConfig {
+        s.networks.get_mut(&n).unwrap()
+    }
+
+    fn find<'a>(s: &'a Store, n: BNetwork, id: &str) -> Option<&'a Source> {
+        s.networks[&n].source(id)
+    }
+
+    #[test]
+    fn version_3_defaults_become_version_4_defaults() {
+        let up = upgraded(&version_3());
+        for n in [BNetwork::Mainnet, BNetwork::Testnet4, BNetwork::Signet] {
+            assert_eq!(up.networks[&n].sources, sources::defaults(n), "{n:?}: the Electrum onion takes fees; the signet servers come off, pinned");
+        }
+    }
+
+    #[test]
+    fn esplora_with_history_moves_to_the_operators_electrum_entry() {
+        let mut old = version_3();
+        for id in ["blockstream.info", "blockstream.info-onion", "mempool.space"] {
+            let s = net(&mut old, BNetwork::Mainnet).sources.iter_mut().find(|s| s.id == id).unwrap();
+            (s.enabled, s.history, s.tor) = (true, true, id == "blockstream.info-onion");
+        }
+        let bi = net(&mut old, BNetwork::Mainnet).sources.iter_mut().find(|s| s.id == "blockstream.info").unwrap();
+        bi.credentials = Some(Credentials { username: "u".into(), password: "p".into() });
+        bi.cert_sha256 = Some("ab".repeat(32));
+        net(&mut old, BNetwork::Signet).sources[1].history = true;
+        let up = upgraded(&old);
+        let e = find(&up, BNetwork::Mainnet, "electrum.blockstream.info").unwrap();
+        assert_eq!((e.enabled, e.history, e.tor), (true, true, false), "the same use, history and tor");
+        assert_eq!((&e.credentials, &e.cert_sha256), (&None, &None), "no pin or credentials carried over");
+        let o = find(&up, BNetwork::Mainnet, "electrum.blockstream.info-onion").unwrap();
+        assert_eq!((o.enabled, o.history, o.tor), (true, true, true));
+        assert!(up.networks[&BNetwork::Mainnet].sources.iter().all(|s| s.operator != "mempool.space"), "no Electrum entry of its own: removed");
+        assert_eq!(up.networks[&BNetwork::Signet].sources, sources::defaults(BNetwork::Signet), "signet has no Electrum default on");
+
+        // A history server switched off keeps history, off; one already on keeps its own tor.
+        let mut old = version_3();
+        let main = net(&mut old, BNetwork::Mainnet);
+        main.sources.iter_mut().filter(|s| s.id == "blockstream.info").for_each(|s| (s.history, s.tor) = (true, false));
+        main.sources.iter_mut().filter(|s| s.id == "electrum.blockstream.info-onion").for_each(|s| s.enabled = true);
+        main.sources.iter_mut().filter(|s| s.id == "blockstream.info-onion").for_each(|s| (s.enabled, s.history) = (false, true));
+        let up = upgraded(&old);
+        let e = find(&up, BNetwork::Mainnet, "electrum.blockstream.info").unwrap();
+        assert_eq!((e.enabled, e.history, e.tor), (false, true, false));
+        let o = find(&up, BNetwork::Mainnet, "electrum.blockstream.info-onion").unwrap();
+        assert_eq!((o.enabled, o.history, o.tor), (true, true, true));
+    }
+
+    #[test]
+    fn other_esplora_entries_and_their_suspicions_go() {
+        let mut old = version_3();
+        let main = net(&mut old, BNetwork::Mainnet);
+        main.sources.iter_mut().for_each(|s| s.enabled = s.kind != Kind::Esplora || s.id == "blockstream.info");
+        main.sources.retain(|s| s.kind != Kind::Rpc);
+        main.sources.insert(1, Source { credentials: Some(Credentials { username: "u".into(), password: "p".into() }), ..esplora("mine", "https://esplora.example/api", "example", true) });
+        main.suspects.insert("blockstream.info".into(), Suspicion { kind: "anchor_mismatch".into(), height: None, at: 1 });
+        main.suspects.insert(sources::KYOTO_ID.into(), Suspicion { kind: "authority_suspect".into(), height: None, at: 2 });
+        let up = upgraded(&old);
+        let main = &up.networks[&BNetwork::Mainnet];
+        let ids: Vec<&str> = main.sources.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["kyoto", "electrum.blockstream.info-onion", "electrum.blockstream.info", "local"], "user-added and fee-only Esplora removed");
+        assert!(main.sources.iter().all(|s| s.enabled), "what was on stays on");
+        assert_eq!(main.suspects.keys().collect::<Vec<_>>(), ["kyoto"]);
+    }
+
+    #[test]
+    fn publicnode_goes_and_kyoto_comes_back_if_it_was_alone() {
+        let mut old = version_3();
+        // "Use only this": PublicNode on, every other source off.
+        net(&mut old, BNetwork::Mainnet).sources.iter_mut().for_each(|s| s.enabled = s.id == PUBLICNODE.0);
+        let up = upgraded(&old);
+        let main = &up.networks[&BNetwork::Mainnet];
+        assert!(main.source(PUBLICNODE.0).is_none());
+        assert_eq!(main.sources.iter().filter(|s| s.enabled).map(|s| s.id.as_str()).collect::<Vec<_>>(), ["kyoto"]);
+
+        // Beside your node it just goes; your own entry for its URL stays.
+        let mut old = version_3();
+        net(&mut old, BNetwork::Mainnet).sources.iter_mut().for_each(|s| s.enabled = matches!(s.kind, Kind::Rpc | Kind::Local));
+        let up = upgraded(&old);
+        let main = &up.networks[&BNetwork::Mainnet];
+        assert_eq!(main.sources.iter().filter(|s| s.enabled).map(|s| s.id.as_str()).collect::<Vec<_>>(), ["local"]);
+        assert!(main.source(PUBLICNODE.0).is_none());
+        let mut old = version_3();
+        let main = net(&mut old, BNetwork::Mainnet);
+        main.sources.retain(|s| s.id != PUBLICNODE.0);
+        main.sources.push(rpc("my-publicnode", PUBLICNODE.1, true));
+        assert_eq!(find(&upgraded(&old), BNetwork::Mainnet, "my-publicnode").map(|s| s.enabled), Some(true), "the user's, not the catalog's");
+    }
+
+    #[test]
+    fn local_wins_over_rpc() {
+        let mut old = version_3();
+        let main = net(&mut old, BNetwork::Mainnet);
+        main.sources.retain(|s| s.id != PUBLICNODE.0);
+        main.sources.push(Source { credentials: Some(Credentials { username: "u".into(), password: "p".into() }), ..rpc("nas", "http://192.168.1.20:8332", true) });
+        main.sources.iter_mut().filter(|s| s.kind == Kind::Local).for_each(|s| s.enabled = true);
+        let up = upgraded(&old);
+        let (local, nas) = (find(&up, BNetwork::Mainnet, "local").unwrap(), find(&up, BNetwork::Mainnet, "nas").unwrap());
+        assert_eq!((local.enabled, nas.enabled, nas.credentials.is_some()), (true, false, true), "switched off, not deleted");
+        // Without the local node on, the RPC endpoint stays on.
+        net(&mut old, BNetwork::Mainnet).sources.iter_mut().filter(|s| s.kind == Kind::Local).for_each(|s| s.enabled = false);
+        assert!(find(&upgraded(&old), BNetwork::Mainnet, "nas").unwrap().enabled);
+    }
+
+    #[test]
+    fn new_default_servers_are_added_off_once() {
+        let mut old = version_3();
+        let signet = net(&mut old, BNetwork::Signet);
+        signet.sources.push(Source { id: "mine".into(), url: "ssl://electrum.emzy.de:53002".into(), ..sources::defaults(BNetwork::Signet)[1].clone() });
+        let up = upgraded(&old);
+        let ids: Vec<&str> = up.networks[&BNetwork::Signet].sources.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["kyoto", "signet-electrumx.wakiyamap.dev", "local", "mine"], "not twice under another id");
+        // A full list takes what fits.
+        let mut full = version_3();
+        let signet = net(&mut full, BNetwork::Signet);
+        signet.sources.retain(|s| s.kind != Kind::Esplora);
+        for i in signet.sources.len()..sources::MAX_SOURCES - 1 {
+            signet.sources.push(Source { id: format!("s{i}"), url: format!("ssl://s{i}.example:50002"), ..sources::defaults(BNetwork::Signet)[1].clone() });
+        }
+        let signet = &upgraded(&full).networks[&BNetwork::Signet];
+        assert_eq!((signet.sources.len(), signet.source("electrum.emzy.de").is_some()), (sources::MAX_SOURCES, true));
+        // Removed after version 4, a default stays removed.
+        let mut v4 = configured();
+        net(&mut v4, BNetwork::Signet).sources.retain(|s| s.id != "electrum.emzy.de");
+        assert!(find(&upgraded(&v4), BNetwork::Signet, "electrum.emzy.de").is_none());
+    }
+
+    #[test]
+    fn esplora_is_never_loaded_from_a_version_4_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let mut s = configured();
+        net(&mut s, BNetwork::Mainnet).sources.push(esplora("mine", "https://esplora.example/api", "example", true));
+        s.save(&path).unwrap();
+        assert!(matches!(Store::load(&path), Loaded::Corrupt(e) if e.contains(sources::ESPLORA_GONE)));
     }
 
     #[test]
@@ -309,9 +512,8 @@ mod tests {
         assert!(matches!(Store::load(&path), Loaded::Absent));
         let mut store = configured();
         let main = store.networks.get_mut(&BNetwork::Mainnet).unwrap();
-        main.sources[2].credentials = Some(Credentials { username: "u".into(), password: "p".into() });
-        main.sources[2].kind = Kind::Esplora;
-        main.suspects.insert("blockstream.info".into(), Suspicion { kind: "anchor_mismatch".into(), height: Some(7), at: 9 });
+        main.sources.push(Source { credentials: Some(Credentials { username: "u".into(), password: "p".into() }), ..rpc("nas", "https://node.example", false) });
+        main.suspects.insert("electrum.blockstream.info".into(), Suspicion { kind: "anchor_mismatch".into(), height: Some(7), at: 9 });
         main.own_peers = vec!["203.0.113.5:8333".into()];
         store.save(&path).unwrap();
         assert!(!tmp_path(&path).exists());
@@ -385,7 +587,7 @@ mod tests {
         let fresh = Store::load_or_empty(&path);
         assert_eq!((fresh.tor_use, fresh.tor_use_chosen), (TorUse::Identifying, false));
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 3") && text.contains("\"torUse\": \"identifying\"") && text.contains("\"torUseChosen\": false"), "{text}");
+        assert!(text.contains("\"version\": 4") && text.contains("\"torUse\": \"identifying\"") && text.contains("\"torUseChosen\": false"), "{text}");
 
         // A version 2 file, which has neither field: everything stays on Tor, the choice still to make.
         let mut v2 = serde_json::to_value(configured()).unwrap();
@@ -416,7 +618,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
         let mut bad = configured();
-        bad.networks.get_mut(&BNetwork::Mainnet).unwrap().sources[1].url = "http://blockstream.info/api".into();
+        bad.networks.get_mut(&BNetwork::Mainnet).unwrap().sources[2].url = "tcp://electrum.blockstream.info:50001".into();
         bad.save(&path).unwrap();
         assert!(matches!(Store::load(&path), Loaded::Corrupt(e) if e.contains("mainnet")));
         let mut socks = configured();
@@ -456,14 +658,14 @@ mod tests {
     #[test]
     fn suspicions_follow_the_source_url() {
         let mut cfg = NetConfig::seeded(BNetwork::Mainnet);
-        for id in ["blockstream.info", "mempool.space"] {
+        for id in ["electrum.blockstream.info", "electrum.blockstream.info-onion"] {
             cfg.suspects.insert(id.into(), Suspicion { kind: "k".into(), height: None, at: 1 });
         }
         let mut list = cfg.sources.clone();
-        list.retain(|s| s.id != "mempool.space");
+        list.retain(|s| s.id != "electrum.blockstream.info-onion");
         cfg.replace_sources(list.clone());
-        assert_eq!(cfg.suspects.keys().collect::<Vec<_>>(), ["blockstream.info"]);
-        list.iter_mut().filter(|s| s.id == "blockstream.info").for_each(|s| s.url = "https://elsewhere.example/api".into());
+        assert_eq!(cfg.suspects.keys().collect::<Vec<_>>(), ["electrum.blockstream.info"]);
+        list.iter_mut().filter(|s| s.id == "electrum.blockstream.info").for_each(|s| s.url = "ssl://elsewhere.example:50002".into());
         cfg.replace_sources(list);
         assert!(cfg.suspects.is_empty());
     }

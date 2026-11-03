@@ -125,11 +125,11 @@ fn the_default_route_table() {
     assert_eq!(ids(&rt, "chain"), ["kyoto"]);
     assert_eq!(ids(&rt, "history"), ["kyoto"], "no server is asked about addresses");
     assert!(ids(&rt, "pending").is_empty());
-    assert_eq!(ids(&rt, "fees"), ["blockstream.info-onion", "kyoto"]);
+    assert_eq!(ids(&rt, "fees"), ["electrum.blockstream.info-onion", "kyoto"]);
     assert_eq!(ids(&rt, "broadcast"), ["kyoto"]);
-    assert_eq!(ids(&rt, "check"), ["blockstream.info-onion"]);
-    assert_eq!((route_of(&rt, "fees", "blockstream.info-onion"), route_of(&rt, "chain", "kyoto")), ("onion".into(), "onion".into()));
-    assert_eq!(rt["crossCheck"], true);
+    assert_eq!(ids(&rt, "check"), ["electrum.blockstream.info-onion"]);
+    assert_eq!((route_of(&rt, "fees", "electrum.blockstream.info-onion"), route_of(&rt, "chain", "kyoto")), ("onion".into(), "onion".into()));
+    assert!(rt.get("crossCheck").is_none() && v(h.node.get_sources("mainnet")).get("crossCheck").is_none(), "an older core only printed it");
     let shipped = peers::shipped(BNetwork::Mainnet);
     assert_eq!(peer_strings(&rt["peers"]), shipped.peers, "the whole curated list: the wallet core picks its own 8");
     assert!(rt["peers"].as_array().unwrap().iter().all(|p| p["source"] == "list" && p["ok"] == false), "none worked yet");
@@ -137,9 +137,11 @@ fn the_default_route_table() {
     let entry = &rt["fees"][0];
     assert_eq!(entry.as_object().unwrap().keys().cloned().collect::<Vec<_>>(), ["id", "kind", "operator", "route", "url"]);
     for role in ["chain", "history", "pending", "fees", "broadcast", "check"] {
-        assert!(rt[role].as_array().unwrap().iter().all(|e| e["id"] != "mempool.space"), "{role}: a disabled source is never routed");
+        assert!(rt[role].as_array().unwrap().iter().all(|e| e["id"] != "electrum.blockstream.info"), "{role}: a disabled source is never routed");
     }
     assert_eq!(ids(&v(h.node.route_table("testnet4")), "fees"), ["electrum-testnet4-onion", "kyoto"]);
+    let signet = v(h.node.route_table("signet"));
+    assert_eq!((ids(&signet, "fees"), ids(&signet, "check")), (vec!["kyoto".to_string()], vec![]), "Kyoto alone, its fee the relay floor");
     assert_eq!(route_of(&v(h.node.route_table("testnet4")), "fees", "electrum-testnet4-onion"), "onion");
 }
 
@@ -149,11 +151,11 @@ fn routes_for_every_combination_of_tor_lan_and_onion() {
     let h = configured();
     let o = onion();
     let list = json!([
-        {"id": "public-tor", "kind": "esplora", "url": "https://esplora.example/api", "tor": true},
-        {"id": "public-direct", "kind": "esplora", "url": "https://direct.example/api", "tor": false},
+        {"id": "public-tor", "kind": "electrum", "url": "electrum.example", "tor": true},
+        {"id": "public-direct", "kind": "electrum", "url": "direct.example", "tor": false},
         {"id": "lan-tor", "kind": "electrum", "url": "192.168.1.20:50001", "tor": true},
         {"id": "lan-direct", "kind": "electrum", "url": "tcp://192.168.1.21:50001", "tor": false},
-        {"id": "lan-name", "kind": "esplora", "url": "http://umbrel.local:3002/api"},
+        {"id": "lan-name", "kind": "electrum", "url": "tcp://umbrel.local:50001"},
         {"id": "onion-tor", "kind": "electrum", "url": format!("{o}:110"), "tor": true},
     ]);
     let s = v(h.node.set_sources("signet", &list.to_string()));
@@ -175,7 +177,7 @@ fn routes_for_every_combination_of_tor_lan_and_onion() {
     let all = ["public-tor", "public-direct", "lan-tor", "lan-direct", "lan-name", "onion-tor"];
     let rt = v(h.node.route_table("signet"));
     assert_eq!(ids(&rt, "check"), all, "with the proxy every source is routed");
-    assert_eq!(ids(&rt, "chain"), ["lan-tor", "lan-direct", "onion-tor"], "Electrum servers define the chain with Kyoto absent");
+    assert_eq!(ids(&rt, "chain"), all, "Electrum servers define the chain with Kyoto absent");
     for (id, route) in [("public-tor", "tor"), ("public-direct", "direct"), ("lan-tor", "direct"), ("lan-direct", "direct"), ("lan-name", "direct"), ("onion-tor", "onion")] {
         assert_eq!(route_of(&rt, "check", id), route, "{id}");
     }
@@ -249,23 +251,23 @@ fn kyoto_routes_with_its_peers() {
 #[test]
 fn history_exposes_addresses_and_credentials_never_come_back() {
     let h = configured();
-    let s = v(h.node.set_source("mainnet", "blockstream.info", r#"{"use":true,"history":true}"#));
-    assert_eq!(s["exposes"], json!([{"id": "blockstream.info", "url": "https://blockstream.info/api", "operator": "blockstream.info", "lan": false}]));
+    let s = v(h.node.set_source("mainnet", "electrum.blockstream.info", r#"{"use":true,"history":true}"#));
+    assert_eq!(s["exposes"], json!([{"id": "electrum.blockstream.info", "url": "ssl://electrum.blockstream.info:50002", "operator": "blockstream.info", "lan": false}]));
     let rt = v(h.node.route_table("mainnet"));
-    assert_eq!((ids(&rt, "history"), ids(&rt, "pending")), (vec!["kyoto".to_string(), "blockstream.info".into()], vec!["blockstream.info".to_string()]));
+    assert_eq!((ids(&rt, "history"), ids(&rt, "pending")), (vec!["kyoto".to_string(), "electrum.blockstream.info".into()], vec!["electrum.blockstream.info".to_string()]));
     assert_eq!(ids(&rt, "broadcast"), ["kyoto"], "Kyoto broadcasts while it is on");
 
     let mut list = s["sources"].clone();
-    list.as_array_mut().unwrap().push(json!({"id": "mine", "kind": "esplora", "url": "https://me:s3cret@esplora.example/api"}));
+    list.as_array_mut().unwrap().push(json!({"id": "mine", "kind": "rpc", "url": "https://me:s3cret@node.example"}));
     let s = v(h.node.set_sources("mainnet", &list.to_string()));
     let text = s.to_string();
     assert!(!text.contains("s3cret") && !text.contains("me:"), "{text}");
     let mine = s["sources"].as_array().unwrap().iter().find(|x| x["id"] == "mine").unwrap().clone();
-    assert_eq!((mine["url"].as_str(), &mine["hasCredentials"]), (Some("https://esplora.example/api"), &json!(true)));
+    assert_eq!((mine["url"].as_str(), &mine["hasCredentials"]), (Some("https://node.example"), &json!(true)));
     for read in [h.node.get_sources("mainnet"), h.node.route_table("mainnet"), h.node.source_health("mainnet")] {
         assert!(!read.contains("s3cret"), "{read}");
     }
-    assert_eq!(v(h.node.route_table("mainnet"))["check"].as_array().unwrap().iter().find(|e| e["id"] == "mine").unwrap()["credentials"], true);
+    assert_eq!(v(h.node.route_table("mainnet"))["chain"][0], json!({"id": "mine", "kind": "rpc", "url": "https://node.example", "operator": "node.example", "route": "tor", "credentials": true, "userAdded": true}));
     // A round trip of what get_sources returned keeps them; only the wallet core reads them.
     let back = v(h.node.get_sources("mainnet"))["sources"].clone();
     h.node.set_sources("mainnet", &back.to_string());
@@ -294,8 +296,8 @@ fn settings_are_locked_while_a_wallet_is_open() {
     // Another network's sources still change, but not the proxy every network shares.
     assert_eq!(v(h.node.set_source("mainnet", KYOTO_ID, r#"{"use":false}"#))["ok"], true);
     // Health stays live: reports, clearing suspects and probes go on.
-    assert_eq!(v(h.node.report_mismatch("signet", "blockstream.info-onion", "anchor_mismatch", "325000"))["suspect"], true);
-    assert_eq!(v(h.node.clear_suspect("signet", "blockstream.info-onion"))["cleared"], true);
+    assert_eq!(v(h.node.report_mismatch("signet", "electrum.emzy.de", "anchor_mismatch", "325000"))["suspect"], true);
+    assert_eq!(v(h.node.clear_suspect("signet", "electrum.emzy.de"))["cleared"], true);
     assert_eq!(v(h.node.init_defaults())["applied"], json!([]));
     h.node.set_wallet_open("signet", false);
     assert_eq!(v(h.node.set_source("signet", KYOTO_ID, r#"{"use":false}"#))["ok"], true);
@@ -306,7 +308,7 @@ fn settings_are_locked_while_a_wallet_is_open() {
 }
 
 fn answer(net: BNetwork, tip: u64) -> Health {
-    Health::observed(net, Observed { genesis: Some(net.genesis().into()), tip_height: tip, tip_hash: "00".repeat(32), rtt_ms: 700, server_version: None }, now())
+    Health::observed(net, Observed { genesis: net.genesis().into(), tip_height: tip, tip_hash: "00".repeat(32), rtt_ms: 700, server_version: None }, now())
 }
 
 fn poll_all(node: &Node, f: impl Fn(&Target) -> Health) {
@@ -354,7 +356,7 @@ fn health_events_suspects_and_wrong_networks() {
     assert_eq!(v(h.node.clear_suspect("mainnet", "electrum.blockstream.info"))["cleared"], false);
 
     // A server on another network answers but is never routed.
-    let signet_genesis = Observed { genesis: Some(BNetwork::Signet.genesis().into()), tip_height: 270_000, tip_hash: "00".repeat(32), rtt_ms: 1, server_version: None };
+    let signet_genesis = Observed { genesis: BNetwork::Signet.genesis().into(), tip_height: 270_000, tip_hash: "00".repeat(32), rtt_ms: 1, server_version: None };
     poll_all(&h.node, |t| match t.id.as_str() {
         "electrum.blockstream.info" => Health::observed(t.network, signet_genesis.clone(), now()),
         _ => ok(t),
@@ -364,16 +366,18 @@ fn health_events_suspects_and_wrong_networks() {
     assert_eq!(v(h.node.route_table("mainnet"))["unrouted"][0]["reason"], health::WRONG_NETWORK);
     // Two operators' tips 3 blocks apart disagree.
     h.node.set_source("mainnet", "electrum.blockstream.info", r#"{"use":false}"#);
-    h.node.set_source("mainnet", "mempool.space", r#"{"use":true}"#);
+    let mut list = v(h.node.get_sources("mainnet"))["sources"].clone();
+    list.as_array_mut().unwrap().push(json!({"id": "other", "kind": "electrum", "url": "electrum.other.example"}));
+    h.node.set_sources("mainnet", &list.to_string());
     poll_all(&h.node, |t| match t.id.as_str() {
-        "mempool.space" => answer(t.network, 970_841),
+        "other" => answer(t.network, 970_841),
         _ => ok(t),
     });
     assert_eq!(v(h.node.source_health("mainnet"))["overall"], "disagreement");
     // Without a proxy nothing is dialled: Tor sources read no_route.
     h.node.set_proxy("");
     poll_all(&h.node, ok);
-    let sh = v(h.node.source_health("signet"));
+    let sh = v(h.node.source_health("mainnet"));
     assert_eq!((sh["overall"].as_str(), sh["sources"][1]["state"].as_str()), (Some("offline"), Some("no_route")));
 }
 
@@ -382,7 +386,7 @@ fn state_persists() {
     let h = configured();
     h.node.set_proxy("socks5h://127.0.0.1:19050");
     h.node.set_own_peers("signet", r#"["10.0.0.2:38333"]"#);
-    h.node.report_mismatch("mainnet", "blockstream.info-onion", "stale", "970000");
+    h.node.report_mismatch("mainnet", "electrum.blockstream.info-onion", "anchor_mismatch", "970000");
     let path = h.dir.path().join(crate::store::FILE_NAME);
     let again = Node::open(Some(path), Arc::new(|_| {}));
     for net in ["mainnet", "testnet4", "signet"] {
@@ -557,7 +561,7 @@ fn local_node() {
 #[test]
 fn probe_needs_the_health_thread() {
     let h = configured();
-    assert_eq!(v(h.node.probe("signet", "blockstream.info-onion"))["error"], "the health thread is not running");
+    assert_eq!(v(h.node.probe("signet", "electrum.emzy.de"))["error"], "the health thread is not running");
     assert_eq!(v(h.node.probe("signet", "nope"))["error"], "unknown source nope");
     // Kyoto and the local node are not dialled by this module: their state answers at once.
     let p = v(h.node.probe("signet", KYOTO_ID));
@@ -630,7 +634,7 @@ fn every_connection_takes_its_sources_route() {
         h.node.set_sources(net, "[]");
     }
     let list = json!([
-        {"id": "public", "kind": "esplora", "url": "https://esplora.example/api"},
+        {"id": "public", "kind": "electrum", "url": "electrum.example"},
         {"id": "hidden", "kind": "electrum", "url": format!("{o}:110")},
         {"id": "home", "kind": "electrum", "url": format!("tcp://127.0.0.1:{}", lan.local_addr().unwrap().port())},
         {"id": "kyoto", "kind": "kyoto"},
@@ -647,7 +651,7 @@ fn every_connection_takes_its_sources_route() {
     });
     let mut seen = socks.lock().unwrap().clone();
     seen.sort();
-    assert_eq!(seen, [format!("{o}:110"), "esplora.example:443".into()], "only Tor routes, by name");
+    assert_eq!(seen, [format!("{o}:110"), "electrum.example:50002".into()], "only Tor routes, by name");
     // No proxy: the Tor sources fail closed and nothing new reaches the proxy.
     h.node.set_proxy("");
     wait_until("no_route", 10, || {
@@ -778,8 +782,9 @@ fn none_turns_tor_off_and_kyoto_dials_the_clearnet_book() {
     for role in ["chain", "history", "fees", "broadcast", "check"] {
         assert!(t[role].as_array().unwrap().iter().all(|e| e["route"] == "direct"), "{role}: {t}");
     }
-    let unrouted = t["unrouted"].as_array().unwrap();
-    assert!(!unrouted.is_empty() && unrouted.iter().all(|u| u["reason"] == TOR_OFF && u["id"].as_str().unwrap().ends_with("-onion")), "{unrouted:?}");
+    assert_eq!(t["unrouted"], json!([]), "signet's servers are off");
+    let unrouted = v(h.node.route_table("mainnet"))["unrouted"].clone();
+    assert_eq!(unrouted, json!([{"id": "electrum.blockstream.info-onion", "reason": TOR_OFF}]));
     let listed: Vec<String> = peers::shipped_clearnet(BNetwork::Signet).peers.into_iter().map(|p| p.peer).collect();
     let start = peer_strings(&t["peers"]);
     assert!(!start.is_empty() && start.iter().all(|p| listed.contains(p)), "the shipped clearnet list: {start:?}");

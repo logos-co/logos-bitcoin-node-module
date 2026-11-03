@@ -248,7 +248,7 @@ pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
     use crate::net::cert::tests::{RSA, RSA_KEY, V1, V1_KEY, V3, V3_KEY};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 
     /// What the wallet core's `pin::certificate_sha256` returns for the same fixtures, run at its
@@ -280,16 +280,18 @@ pub(crate) mod tests {
         serde_json::json!({"jsonrpc": "2.0", "id": v["id"], "result": result}).to_string() + "\n"
     }
 
-    fn http_reply(path: &str) -> String {
-        let body = match path {
-            "/api/blocks/tip/height" => "970838".to_string(),
-            "/api/blocks/tip/hash" => "ab".repeat(32),
-            _ => crate::network::BNetwork::Mainnet.genesis().to_string(),
+    fn rpc_reply(body: &[u8]) -> String {
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        let result = match v["method"].as_str() {
+            Some("getblockchaininfo") => serde_json::json!({"blocks": 970_838, "bestblockhash": "ab".repeat(32)}),
+            Some("getblockhash") => serde_json::json!(crate::network::BNetwork::Mainnet.genesis()),
+            _ => serde_json::json!({"filter": "00"}),
         };
+        let body = serde_json::json!({"result": result, "error": null, "id": v["id"]}).to_string();
         format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
     }
 
-    /// A loopback TLS server for one certificate and key, answering Electrum or HTTP GETs.
+    /// A loopback TLS server for one certificate and key, answering Electrum or RPC POSTs.
     pub async fn tls_server(cert: &'static [u8], key: &'static [u8], tls12_only: bool) -> u16 {
         let provider = provider();
         let signing = provider.key_provider.load_private_key(PrivateKeyDer::try_from(key).unwrap()).unwrap();
@@ -308,14 +310,21 @@ pub(crate) mod tests {
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else { return };
-                    let (mut s, mut line, mut get) = (BufReader::new(tls), String::new(), None::<String>);
+                    let (mut s, mut line, mut post) = (BufReader::new(tls), String::new(), None::<usize>);
                     while s.read_line(&mut line).await.unwrap_or(0) > 0 {
-                        let reply = if let Some(path) = line.strip_prefix("GET ").and_then(|r| r.split_whitespace().next()) {
-                            get = Some(path.to_string());
+                        let header = line.to_ascii_lowercase();
+                        let reply = if line.starts_with("POST ") {
+                            post = Some(0);
                             None
-                        } else if line.trim().is_empty() {
-                            get.take().map(|p| http_reply(&p))
-                        } else if get.is_none() {
+                        } else if let (Some(len), true) = (post, line.trim().is_empty()) {
+                            let mut body = vec![0u8; len];
+                            let _ = s.read_exact(&mut body).await;
+                            post = None;
+                            Some(rpc_reply(&body))
+                        } else if let (Some(_), Some(n)) = (post, header.strip_prefix("content-length:")) {
+                            post = n.trim().parse().ok();
+                            None
+                        } else if post.is_none() {
                             Some(electrum_reply(&line))
                         } else {
                             None

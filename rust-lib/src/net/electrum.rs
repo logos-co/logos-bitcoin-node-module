@@ -111,7 +111,7 @@ async fn probe_on(url: &str, route: Route, proxy: Option<&ProxyAddr>, iso: &Isol
     let height = tip.get("height").and_then(Value::as_u64).ok_or("headers.subscribe: no height")?;
     let hex_header = tip.get("hex").and_then(Value::as_str).ok_or("headers.subscribe: no header")?;
     Ok(Observed {
-        genesis: Some(genesis),
+        genesis,
         tip_height: height,
         tip_hash: header_hash(hex_header)?,
         rtt_ms,
@@ -169,7 +169,7 @@ pub(crate) mod tests {
     async fn probes_a_server_without_naming_any_address() {
         let (url, server) = fake_server(Some(BNetwork::Mainnet.genesis()), 970_838).await;
         let o = probe(&url, Route::Direct, None, &Isolation::fresh(), None).await.0.unwrap();
-        assert_eq!((o.tip_height, o.tip_hash.as_str(), o.genesis.as_deref()), (970_838, BNetwork::Mainnet.genesis(), Some(BNetwork::Mainnet.genesis())));
+        assert_eq!((o.tip_height, o.tip_hash.as_str(), o.genesis.as_str()), (970_838, BNetwork::Mainnet.genesis(), BNetwork::Mainnet.genesis()));
         assert_eq!(o.server_version.as_deref(), Some("fake 1.0"));
         drop(o);
         let seen = server.await.unwrap();
@@ -180,7 +180,7 @@ pub(crate) mod tests {
     async fn asks_for_the_genesis_header_when_features_leave_it_out() {
         let (url, server) = fake_server(None, 5).await;
         let o = probe(&url, Route::Direct, None, &Isolation::fresh(), None).await.0.unwrap();
-        assert_eq!(o.genesis.as_deref(), Some(BNetwork::Mainnet.genesis()));
+        assert_eq!(o.genesis, BNetwork::Mainnet.genesis());
         drop(o);
         assert_eq!(server.await.unwrap().last().unwrap(), "blockchain.block.header [0]");
     }

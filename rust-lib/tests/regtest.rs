@@ -1,4 +1,4 @@
-//! Regtest in its own process. The live check needs electrs on loopback (REGTEST_ESPLORA optional):
+//! Regtest in its own process. The live check needs electrs on loopback:
 //! REGTEST_ELECTRUM=tcp://127.0.0.1:60401 cargo test --no-default-features --test regtest -- --ignored --nocapture
 //! The harvest check starts its own bitcoind (31.x): BITCOIND=/path/to/bitcoind ... -- --ignored harvest_against
 
@@ -51,11 +51,12 @@ fn route_table_over_loopback() {
     let list = json!([
         {"id": "kyoto", "kind": "kyoto"},
         {"id": "electrs", "kind": "electrum", "url": "127.0.0.1:60401", "history": true},
-        {"id": "esplora", "kind": "esplora", "url": "127.0.0.1:3002"},
+        {"id": "fulcrum", "kind": "electrum", "url": "127.0.0.1:50001"},
+        {"id": "node", "kind": "rpc", "url": "127.0.0.1:18443", "use": false},
     ]);
     let s = v(node.set_sources("regtest", &list.to_string()));
     assert_eq!(s["sources"][1]["url"], "tcp://127.0.0.1:60401");
-    assert_eq!(s["sources"][2]["url"], "http://127.0.0.1:3002");
+    assert_eq!(s["sources"][3]["url"], "http://127.0.0.1:18443");
     assert_eq!(s["exposes"][0]["lan"], true);
     assert_eq!(s["withoutTor"], json!([]), "loopback is the user's own network");
     let rt = v(node.route_table("regtest"));
@@ -63,9 +64,9 @@ fn route_table_over_loopback() {
     assert_eq!(ids("chain"), ["kyoto"]);
     assert_eq!(ids("history"), ["kyoto", "electrs"]);
     assert_eq!(ids("pending"), ["electrs"]);
-    assert_eq!(ids("fees"), ["electrs", "esplora", "kyoto"]);
+    assert_eq!(ids("fees"), ["electrs", "fulcrum", "kyoto"]);
     assert_eq!(ids("broadcast"), ["kyoto"]);
-    assert_eq!(ids("check"), ["electrs", "esplora"]);
+    assert_eq!(ids("check"), ["electrs", "fulcrum"]);
     assert!(rt["chain"].as_array().unwrap().iter().chain(rt["check"].as_array().unwrap()).all(|e| e["route"] == "direct"));
     let own = json!([{"peer": "127.0.0.1:18444", "source": "own", "ok": false}]);
     assert_eq!((&rt["peers"], &rt["proxy"], &rt["unrouted"]), (&own, &Value::Null, &json!([])));
@@ -98,20 +99,16 @@ fn the_poller_dials_regtest_without_a_proxy() {
     assert!(poller.stop(Duration::from_millis(1000)), "joined");
 }
 
-/// The real poller against a regtest Electrum server (electrs) and, optionally, Esplora.
+/// The real poller against a regtest Electrum server (electrs).
 #[test]
 #[ignore]
 fn poller_reports_a_live_regtest_chain() {
     configure();
     let electrum = std::env::var("REGTEST_ELECTRUM").expect("set REGTEST_ELECTRUM=tcp://127.0.0.1:PORT");
-    let esplora = std::env::var("REGTEST_ESPLORA").ok();
     let dir = tempfile::tempdir().unwrap();
     let node = open(&dir);
-    let mut list = vec![json!({"id": "electrs", "kind": "electrum", "url": electrum, "operator": "local-electrs"})];
-    if let Some(e) = &esplora {
-        list.push(json!({"id": "esplora", "kind": "esplora", "url": e, "operator": "local-esplora"}));
-    }
-    assert_eq!(v(node.set_sources("regtest", &Value::from(list).to_string()))["ok"], true);
+    let list = json!([{"id": "electrs", "kind": "electrum", "url": electrum, "operator": "local-electrs"}]);
+    assert_eq!(v(node.set_sources("regtest", &list.to_string()))["ok"], true);
     if let Ok(peer) = std::env::var("REGTEST_PEER") {
         assert_eq!(v(node.set_own_peers("regtest", &json!([peer]).to_string()))["ok"], true);
     }
@@ -127,7 +124,7 @@ fn poller_reports_a_live_regtest_chain() {
     }
     let h = v(node.source_health("regtest"));
     println!("{h}\n{}", node.route_table("regtest"));
-    for s in h["sources"].as_array().unwrap().iter().filter(|s| s["kind"] == "electrum" || s["kind"] == "esplora") {
+    for s in h["sources"].as_array().unwrap().iter().filter(|s| s["kind"] == "electrum") {
         assert_eq!((s["state"].as_str(), s["route"].as_str()), (Some("ok"), Some("direct")), "{s}");
         assert!(s["tipHeight"].as_str().unwrap().parse::<u64>().unwrap() > 0 && s["tipHash"].as_str().unwrap().len() == 64);
     }

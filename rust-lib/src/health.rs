@@ -45,10 +45,10 @@ pub struct Health {
     pub certificate: Option<CertInfo>,
 }
 
-/// What an address-free probe saw. `genesis` is `None` when this probe did not ask.
+/// What an address-free probe saw.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observed {
-    pub genesis: Option<String>,
+    pub genesis: String,
     pub tip_height: u64,
     pub tip_hash: String,
     pub rtt_ms: u64,
@@ -68,7 +68,7 @@ impl Health {
 
     /// A server whose genesis block is another network's answers, but must not be routed.
     pub fn observed(net: BNetwork, o: Observed, now: u64) -> Self {
-        let wrong = o.genesis.as_deref().is_some_and(|g| !g.eq_ignore_ascii_case(net.genesis()));
+        let wrong = !o.genesis.eq_ignore_ascii_case(net.genesis());
         Self {
             state: if wrong { State::WrongNetwork } else { State::Ok },
             tip_height: Some(o.tip_height),
@@ -129,9 +129,13 @@ pub fn overall(rows: &[Row]) -> Overall {
 mod tests {
     use super::*;
 
-    fn seen(net: BNetwork, genesis: Option<&str>, tip: u64) -> Health {
-        let o = Observed { genesis: genesis.map(String::from), tip_height: tip, tip_hash: "00".repeat(32), rtt_ms: 900, server_version: None };
+    fn seen(net: BNetwork, genesis: &str, tip: u64) -> Health {
+        let o = Observed { genesis: genesis.into(), tip_height: tip, tip_hash: "00".repeat(32), rtt_ms: 900, server_version: None };
         Health::observed(net, o, 1_000)
+    }
+
+    fn tip(t: u64) -> Health {
+        seen(BNetwork::Mainnet, BNetwork::Mainnet.genesis(), t)
     }
 
     fn row<'a>(operator: &'a str, h: Option<&'a Health>) -> Row<'a> {
@@ -141,19 +145,18 @@ mod tests {
     #[test]
     fn genesis_decides_the_network() {
         let main = BNetwork::Mainnet.genesis();
-        assert_eq!(seen(BNetwork::Mainnet, Some(main), 1).state, State::Ok);
-        assert_eq!(seen(BNetwork::Mainnet, Some(&main.to_uppercase()), 1).state, State::Ok);
-        assert_eq!(seen(BNetwork::Mainnet, None, 1).state, State::Ok, "not asked this time");
-        let wrong = seen(BNetwork::Testnet4, Some(main), 1);
+        assert_eq!(seen(BNetwork::Mainnet, main, 1).state, State::Ok);
+        assert_eq!(seen(BNetwork::Mainnet, &main.to_uppercase(), 1).state, State::Ok);
+        let wrong = seen(BNetwork::Testnet4, main, 1);
         assert_eq!(wrong.state, State::WrongNetwork);
         assert!(wrong.error.unwrap().starts_with(WRONG_NETWORK));
-        let v = serde_json::to_value(seen(BNetwork::Mainnet, None, 970_838)).unwrap();
+        let v = serde_json::to_value(tip(970_838)).unwrap();
         assert_eq!((&v["tipHeight"], &v["rttMs"], &v["checkedAt"], &v["state"]), (&"970838".into(), &"900".into(), &"1000".into(), &"ok".into()));
     }
 
     #[test]
     fn verdicts() {
-        let (a, b, far) = (seen(BNetwork::Mainnet, None, 100), seen(BNetwork::Mainnet, None, 102), seen(BNetwork::Mainnet, None, 103));
+        let (a, b, far) = (tip(100), tip(102), tip(103));
         assert_eq!(overall(&[row("x", Some(&a)), row("y", Some(&b))]), Overall::Ok);
         assert_eq!(overall(&[row("x", Some(&a)), row("y", Some(&far))]), Overall::Disagreement);
         assert_eq!(overall(&[row("x", Some(&a)), row("X", Some(&far))]), Overall::Ok, "one operator's hosts");
