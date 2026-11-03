@@ -378,7 +378,6 @@ impl Inner {
             "broadcast": r.broadcast,
             "check": r.check,
             "peers": peers,
-            "crossCheck": r.cross_check,
             "unrouted": unrouted,
             "torUse": self.store.tor_use,
             "kyotoSplit": split,
@@ -391,7 +390,7 @@ impl Inner {
         let Some(cfg) = self.cfg(net) else {
             return json!({"network": net.name(), "configured": false, "walletOpen": wallet_open, "proxy": self.store.proxy(),
                           "torUse": self.store.tor_use, "torUseChosen": self.store.tor_use_chosen,
-                          "sources": [], "exposes": [], "withoutTor": [], "crossCheck": false});
+                          "sources": [], "exposes": [], "withoutTor": []});
         };
         let route = |s: &Source| self.route_of(cfg, s);
         let lan = |s: &Source| Self::lan_of(cfg, s);
@@ -414,7 +413,6 @@ impl Inner {
             "sources": list,
             "exposes": sources::exposes(&cfg.sources, lan),
             "withoutTor": sources::without_tor(&cfg.sources, route, lan),
-            "crossCheck": self.roles(net, cfg).cross_check,
         })
     }
 
@@ -828,8 +826,8 @@ impl Node {
                          "torUse": inner.store.tor_use, "torUseChosen": inner.store.tor_use_chosen}))
     }
 
-    /// Fills what is absent, field by field: the proxy, and each network's sources (Kyoto on,
-    /// one Esplora server for fee rates, every other source off). Never changes what is set.
+    /// Fills what is absent, field by field: the proxy, and each network's sources (Kyoto on, one
+    /// Electrum server for fee rates but on signet, every other source off). Never changes what is set.
     pub fn init_defaults(&self) -> String {
         self.mutate(
             true,
@@ -1129,7 +1127,7 @@ impl Node {
         }
     }
 
-    /// An Esplora server's credentials, for the wallet core alone.
+    /// An RPC server's credentials, for the wallet core alone.
     pub fn source_credentials(&self, network: &str, source_id: &str) -> String {
         let net = match parse_net(network) {
             Ok(n) => n,

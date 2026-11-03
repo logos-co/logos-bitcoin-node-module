@@ -1,4 +1,4 @@
-//! HTTP/1.1 GETs over a stream `dial` opened: Esplora servers.
+//! HTTP/1.1 JSON-RPC POSTs over a stream `dial` opened: Bitcoin Core RPC.
 
 use base64::Engine;
 use http::{header, Request, StatusCode};
@@ -53,24 +53,6 @@ impl Conn {
         Ok(Self { sender, host, base: p.path, auth, cert })
     }
 
-    /// GETs the base URL's path followed by `path`; a body longer than `limit` is an error.
-    pub async fn get(&mut self, path: &str, limit: usize) -> Result<(StatusCode, Bytes), String> {
-        self.sender.ready().await.map_err(|e| format!("http: {e}"))?;
-        let target = match format!("{}{path}", self.base) {
-            t if t.is_empty() => "/".to_string(),
-            t => t,
-        };
-        let mut req = Request::get(target).header(header::HOST, &self.host).header(header::USER_AGENT, USER_AGENT);
-        if let Some(a) = &self.auth {
-            req = req.header(header::AUTHORIZATION, a);
-        }
-        let req = req.body(Full::new(Bytes::new())).map_err(|e| format!("http: {e}"))?;
-        let resp = self.sender.send_request(req).await.map_err(|e| format!("http: {e}"))?;
-        let status = resp.status();
-        let body = Limited::new(resp.into_body(), limit).collect().await.map_err(|e| format!("http body: {e}"))?.to_bytes();
-        Ok((status, body))
-    }
-
     /// JSON-RPC POST to the configured endpoint; never follows redirects.
     pub async fn rpc(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
         self.sender.ready().await.map_err(|e| format!("http: {e}"))?;
@@ -89,16 +71,6 @@ impl Conn {
         let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| "RPC response is not JSON")?;
         if v["id"] != 1 { return Err("RPC response ID mismatch".into()); }
         Ok(v)
-    }
-
-    /// GET whose answer must be 200 and short UTF-8 text, returned trimmed.
-    pub async fn get_text(&mut self, path: &str) -> Result<String, String> {
-        let (status, body) = self.get(path, 4096).await?;
-        let text = String::from_utf8_lossy(&body).trim().to_string();
-        if status != StatusCode::OK {
-            return Err(format!("{path}: HTTP {} {}", status.as_u16(), text.chars().take(80).collect::<String>()));
-        }
-        Ok(text)
     }
 }
 
@@ -122,23 +94,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_sends_a_generic_request() {
-        let (url, server) = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n970838").await;
+    async fn rpc_sends_a_generic_request() {
+        let (url, server) = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n{\"result\":5,\"error\":null,\"id\":1}").await;
         let mut c = Conn::open(&url, Some(("me", "pw")), Route::Direct, None, &Isolation::fresh(), None).await.unwrap();
-        assert_eq!(c.get_text("/blocks/tip/height").await.unwrap(), "970838");
+        assert_eq!(c.rpc("getblockcount", serde_json::json!([])).await.unwrap()["result"], 5);
         let asked = server.await.unwrap().to_ascii_lowercase();
-        assert!(asked.starts_with("get /api/blocks/tip/height http/1.1\r\n"), "{asked}");
+        assert!(asked.starts_with("post /api http/1.1\r\n"), "{asked}");
         assert!(asked.contains("user-agent: mozilla/5.0\r\n") && asked.contains("authorization: basic bwu6chc=\r\n"), "{asked}");
         assert!(!asked.contains('@'), "{asked}");
     }
 
     #[tokio::test]
-    async fn errors_and_limits() {
-        let (url, _s) = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found").await;
-        let mut c = Conn::open(&url, None, Route::Direct, None, &Isolation::fresh(), None).await.unwrap();
-        assert!(c.get_text("/x").await.unwrap_err().contains("HTTP 404"));
-        let (url, _s) = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789").await;
-        let mut c = Conn::open(&url, None, Route::Direct, None, &Isolation::fresh(), None).await.unwrap();
-        assert!(c.get("", 4).await.is_err(), "over the limit");
+    async fn errors() {
+        for (answer, why) in [
+            ("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found", "RPC HTTP 404"),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nnot json!", "not JSON"),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n{\"id\":2}", "ID mismatch"),
+        ] {
+            let (url, _s) = serve_once(answer).await;
+            let mut c = Conn::open(&url, None, Route::Direct, None, &Isolation::fresh(), None).await.unwrap();
+            let e = c.rpc("getblockcount", serde_json::json!([])).await.unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
     }
 }

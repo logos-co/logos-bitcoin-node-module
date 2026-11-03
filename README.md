@@ -16,14 +16,18 @@ the route are computed. Kinds:
 
 | Kind | url | Fills |
 |---|---|---|
-| `kyoto` | `p2p://peer-list` (id `kyoto`) | chain, history (through block filters), fees (block averages), broadcast |
-| `electrum` | `ssl://host:port` (50002), or `tcp://host:port` (50001) for onion services and your network | history and pending when `history` is on, fees, check, and the chain when Kyoto and the local node are off |
-| `esplora` | `https://host[:port][/path]`, or `http://` for onion services and your network | history and pending when `history` is on, fees, check |
+| `kyoto` | `p2p://peer-list` (id `kyoto`) | chain, history (through block filters), broadcast; for fees, only the relay floor |
+| `electrum` | `ssl://host:port` (50002), or `tcp://host:port` (50001) for onion services and your network | history and pending when `history` is on, fees, check, and the chain when Kyoto and your node are off |
 | `rpc` | `https://host[:port][/path]`, or `http://` for onion services and your network | chain, locally scanned history and pending, fees, broadcast |
 | `local` | `logos://bitcoind_module` (id `local`, stage 2) | chain, history, pending, fees, broadcast |
 
-- `history` means the source is asked about the wallet's addresses. Electrum and Esplora only; RPC never receives wallet addresses. Every reply
-  that changes sources carries `exposes`, the enabled sources that learn the addresses.
+- `local` and `rpc` are your node, in Logos or at an address. At most one of them is on per
+  network: `Enable only one node at a time: the local node or one Bitcoin Core RPC endpoint`.
+- `esplora` is refused: `invalid parameters: <id>: Esplora servers are no longer supported; use
+  an Electrum server`. A store from before version 4 moves its Esplora entries (Store, below).
+- `history` means the source is asked about the wallet's addresses. Electrum only; your node
+  never receives wallet addresses. Every reply that changes sources carries `exposes`, the
+  enabled sources that learn the addresses.
 - `tor` is per source and on by default. Turning it off is refused for an onion service. A
   source reached without Tor by choice is listed in `withoutTor`.
 - A server on your own network is reached directly: loopback, private, CGNAT, link-local and
@@ -33,7 +37,7 @@ the route are computed. Kinds:
   to a direct connection.
 - Operators, not hosts, count: a user-added server defaults to its registered domain
   (`you` on your network), unless the caller names one.
-- An Esplora or RPC server may take HTTP basic auth (`https://user:pw@host/api`, or `credentials`).
+- An RPC server may take HTTP basic auth (`https://user:pw@host`, or `credentials`).
   No read returns it; `get_sources` says `hasCredentials`, and only the wallet core reads it,
   with `source_credentials`. A list sent back without credentials keeps the stored ones.
 - Plain `tcp://` or `http://` is only for an onion service or a server on your network, as in
@@ -47,33 +51,54 @@ the route are computed. Kinds:
 
 ## Defaults
 
-`init_defaults` fills what is absent, field by field: the proxy `tor` (below), and per network Kyoto on, one server for fee rates only (history off), and every other source
-off. Sources are switched on one by one. PublicNode RPC is disabled and direct by default.
-Existing mainnet configurations gain this disabled catalog entry on load, preserving existing
-settings and avoiding a duplicate when the endpoint was already added manually.
+`init_defaults` fills what is absent, field by field: the proxy `tor` (below), and per network
+Kyoto on, one Electrum server for fee rates only (history off), and every other source off.
+Signet runs Kyoto alone, with the relay floor as its fee. Sources are switched on one by one.
 
 | Network | Fee server (on) | Off, ready to switch on |
 |---|---|---|
-| mainnet | Blockstream Esplora, onion | PublicNode Bitcoin Core RPC (direct), blockstream.info, both mempool.space addresses, Blockstream Electrum (TLS and onion) |
-| signet | Blockstream Esplora, onion | blockstream.info, both mempool.space addresses |
+| mainnet | Blockstream Electrum, onion | Blockstream Electrum (TLS) |
+| signet | none: Kyoto alone | emzy.de and wakiyamap.dev Electrum (TLS, pinned) |
 | testnet4 | an Electrum onion service (Fulcrum, plain tcp over Tor) | stagemole.eu and c3-soft.com Electrum (TLS) |
 | regtest | none | only your own sources |
 
-Chosen by checking live on 2026-10-10, each request on a fresh Tor circuit. Blockstream's
-onion answered 8 of 8 on mainnet and signet; mempool.space's onion accepted every connection
-and closed it unanswered (0 of 8), its clearnet API answered 2 to 5 of 8 through Tor and timed
-out directly from our network, and blockstream.info through Tor was rate-limited once (HTTP
-429). An onion service needs no exit relay, which can be blocked or watch the traffic.
-The onion addresses come from each operator: the `Onion-Location` headers of blockstream.info
-and mempool.space, and Blockstream's own Electrum `server.features`.
+Defaults that are on are only servers the web PKI trusts, or onion services. An onion service
+needs no exit relay, which can be blocked or watch the traffic.
 
-Testnet4 was checked on 2026-10-11, three probes per server on fresh circuits. No Esplora
-answered over Tor: mempool.space's API and its Electrum on 40002 timed out (0 of 3), its onion
-closed every connection unanswered, and Blockstream serves no testnet4. Of the seven servers in
+Mainnet and signet were checked on 2026-11-03, 8 probes per server, each on a fresh Tor circuit.
+Blockstream's Electrum onion answered 7 of 8: the miss was a stall in a 2,016-header batch,
+which a fee server is never asked for. Its address comes from blockstream.info's
+`Onion-Location` header and Blockstream's own Electrum `server.features`. Of the three servers
+in Electrum's own signet list, none is both trusted by the web PKI and reachable over Tor:
+mempool.space never opened a connection over Tor (0 of 16), and emzy.de and wakiyamap.dev, both
+self-signed ElectrumX, answered 8 of 8 with their pins. So those two ship pinned and off. Signet
+fee estimates read about 3,900 sat/vB wherever they come from, so the relay floor serves.
+
+Testnet4 was checked on 2026-10-11, three probes per server on fresh circuits. mempool.space's
+Electrum on 40002 timed out (0 of 3), and Blockstream serves no testnet4. Of the seven servers in
 Electrum's own testnet4 list (electrum/chains/testnet4/servers.json), three answered 3 of 3 and
 ship: the onion service on its tcp port, and stagemole.eu and c3-soft.com, whose certificates the
 web PKI trusts. The other four answer only with self-signed certificates (two of them version 1);
 pin one with `certSha256` to use it.
+
+## Store
+
+`bitcoin_sources.json` is at version 4: no Esplora, no PublicNode, and at most one node source
+on. A version 3 or older store moves over on load, per network:
+
+| Before | After |
+|---|---|
+| Blockstream's Esplora onion on mainnet, on | Blockstream's Electrum onion, on, with the same `history` and `tor` |
+| An Esplora entry with `history` on, whose operator has a listed Electrum entry (mainnet's blockstream.info) | That Electrum entry, with the same `use`, `history` and `tor` |
+| Every other Esplora entry: mempool.space, your own, all of signet's | Removed, with its suspect mark |
+| PublicNode | Removed. If it was the only chain source on ("Use only this"), Kyoto is switched back on |
+| The local node and an RPC endpoint both on | The local node; the RPC entry is switched off, not deleted |
+| A default server missing (signet's two) | Added off |
+
+Pins and credentials never move to the Electrum entry: its certificate is another one. An
+Electrum entry that was already on keeps its own `tor`. The file keeps its old version until the
+next save, so an older build still reads it. Older builds set a version 4 store aside as
+unreadable, as they did versions 2 and 3.
 
 ## Tor
 
@@ -116,21 +141,21 @@ its SOCKS port is off (the Tor app turns it on), or it is not available. `source
 `route_table(network)` gives one list per role, each `{ id, kind, url, operator, route }` with
 `route` `tor`, `direct` or `onion`, in failover order:
 
-- `chain`: the local node, then one enabled RPC endpoint, then Kyoto; only when neither is on, every Electrum server (the
+- `chain`: your node, then Kyoto; only when neither is on, every Electrum server (the
   most-work chain wins). It follows what is switched on, so an unreachable Kyoto never hands
   the chain to a server.
-- `history`: the local node, RPC and Kyoto, which learn no address, then servers with history on.
-- `pending`: the local node and RPC, then servers with history on.
-- `fees`: the local node and RPC, every indexed server, then Kyoto.
-- `broadcast`: the local node, then one enabled RPC endpoint, then Kyoto; only when neither is on, the history servers.
-- `check`: every Electrum/Esplora server, asked for tips and headers only.
+- `history`: your node and Kyoto, which learn no address, then servers with history on.
+- `pending`: your node, then servers with history on.
+- `fees`: your node, every Electrum server, then Kyoto (the relay floor).
+- `broadcast`: your node, then Kyoto; only when neither is on, the history servers.
+- `check`: every Electrum server, asked for tips and headers only.
 
-RPC probes check the genesis hash, tip and block-filter availability. Only one RPC endpoint may
-be enabled per network. RPC credentials use the same restricted storage and read API as Esplora.
+RPC credentials are stored owner-only, and only the wallet core reads them, with
+`source_credentials`.
 
 Plus `proxy` (the SOCKS URL to dial; for `tor`, tor_module's port), `peers` (Kyoto's peers,
-below), `crossCheck` (two operators among chain and check), `unrouted` (enabled sources left
-out, and why: no Tor route, suspect, wrong network), `torUse`, and `kyotoSplit`.
+below), `unrouted` (enabled sources left out, and why: no Tor route, suspect, wrong network),
+`torUse`, and `kyotoSplit`. There is no `crossCheck` any more: an older core only printed it.
 
 `kyotoSplit` is set only in `identifying`, with Kyoto on the books (no own peers) and its Tor
 switch on, once both books have usable peers: `{ chain: { route: "direct", peers }, tor: {
@@ -206,8 +231,8 @@ the system resolver and kept as learned with `from` `dns:<seed>`.
 
 The health thread probes every enabled server once a minute, four at a time, on one Tor
 circuit per server: Electrum `server.version`, `server.features` (the genesis block) and
-`blockchain.headers.subscribe`; Esplora `/blocks/tip/height`, `/blocks/tip/hash`, and
-`/block-height/0` once per circuit. A server that does not answer gets a new circuit next round,
+`blockchain.headers.subscribe`; RPC `getblockchaininfo`, `getblockhash 0` and `getblockfilter`
+at the tip (filters available, or a full-block scan). A server that does not answer gets a new circuit next round,
 so a stuck onion connection does not hold its later probes. A server on another network is never routed. `probe`
 asks now and answers within 15 s. A TLS server's row carries `certificate`: `{ certSha256,
 subject, issuer, notBefore, notAfter, trusted }`, read in a handshake that proves the server

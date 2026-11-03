@@ -28,7 +28,7 @@ fn every_default_server_answers() {
     for net in [BNetwork::Mainnet, BNetwork::Testnet4, BNetwork::Signet] {
         for s in defaults(net).into_iter().filter(|s| s.kind.is_server()) {
             let route = route_for(&sources::host(&s), s.tor);
-            targets.push(Target { network: net, id: s.id, kind: s.kind, url: s.url, route, proxy: Some(proxy.clone()), credentials: None, cert_sha256: None });
+            targets.push(Target { network: net, id: s.id, kind: s.kind, url: s.url, route, proxy: Some(proxy.clone()), credentials: None, cert_sha256: s.cert_sha256 });
         }
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -36,7 +36,7 @@ fn every_default_server_answers() {
         stream::iter(targets)
             .map(|t| async move {
                 let t0 = Instant::now();
-                let h = probe(&t, &Isolation::fresh(), true).await;
+                let h = probe(&t, &Isolation::fresh()).await;
                 (t, h, t0.elapsed())
             })
             .buffer_unordered(4)
@@ -53,13 +53,13 @@ fn every_default_server_answers() {
         }
         assert_ne!(h.state, State::WrongNetwork, "{} {} answers for another network", t.network.name(), t.url);
     }
-    // The servers on by default, and Blockstream's Electrum servers over clearnet TLS and onion.
+    // The servers on by default, Blockstream's over clearnet TLS too, and signet's pinned ones.
     for (net, id) in [
-        (BNetwork::Mainnet, "blockstream.info-onion"),
-        (BNetwork::Signet, "blockstream.info-onion"),
+        (BNetwork::Mainnet, "electrum.blockstream.info-onion"),
         (BNetwork::Testnet4, "electrum-testnet4-onion"),
         (BNetwork::Mainnet, "electrum.blockstream.info"),
-        (BNetwork::Mainnet, "electrum.blockstream.info-onion"),
+        (BNetwork::Signet, "electrum.emzy.de"),
+        (BNetwork::Signet, "signet-electrumx.wakiyamap.dev"),
     ] {
         assert!(answered.contains(&(net, id.to_string())), "{} {id} did not answer", net.name());
     }
@@ -83,13 +83,13 @@ fn poller_reports_and_stops() {
     let poller = Poller::start(node.clone()).unwrap();
     let health = |n: &str| serde_json::from_str::<Value>(&node.source_health(n)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(150);
-    while ["mainnet", "signet"].iter().any(|n| health(n)["pending"] != false) && Instant::now() < deadline {
+    while ["mainnet", "testnet4"].iter().any(|n| health(n)["pending"] != false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
     }
     for n in ["mainnet", "testnet4", "signet"] {
         println!("{}\n{}", node.source_health(n), node.route_table(n));
     }
-    for n in ["mainnet", "signet"] {
+    for n in ["mainnet", "testnet4"] {
         let h = health(n);
         assert_eq!(h["pending"], false, "{n} still pending");
         let fee = &h["sources"][1];
@@ -99,5 +99,5 @@ fn poller_reports_and_stops() {
     assert!(poller.stop(Duration::from_millis(1000)));
     println!("poller stopped in {:?}", t0.elapsed());
     let seen = seen.lock().unwrap();
-    assert!(seen.iter().any(|n| n == "mainnet") && seen.iter().any(|n| n == "signet"), "{seen:?}");
+    assert!(seen.iter().any(|n| n == "mainnet") && seen.iter().any(|n| n == "testnet4"), "{seen:?}");
 }

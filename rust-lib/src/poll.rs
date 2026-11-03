@@ -16,7 +16,7 @@ use crate::health::{Health, State};
 use crate::net::client::{dial, Route};
 use crate::net::p2p::{Gossip, Peer, X49};
 use crate::net::socks::{Isolation, ProxyAddr};
-use crate::net::{electrum, esplora};
+use crate::net::{electrum, rpc};
 use crate::network::BNetwork;
 use crate::node::{now, Harvest, Job, Node, Target};
 use crate::sources::{self, Kind};
@@ -137,7 +137,7 @@ async fn run_job(node: Arc<Node>, job: Job) {
         Job::Probe { targets, done } => {
             let mut results = stream::iter(targets)
                 .map(|t| async move {
-                    let h = probe(&t, &Isolation::fresh(), true).await;
+                    let h = probe(&t, &Isolation::fresh()).await;
                     (t, h)
                 })
                 .buffer_unordered(MAX_CONCURRENT);
@@ -190,26 +190,21 @@ async fn ask(seed: &str, route: Route, proxy: Option<&ProxyAddr>, net: BNetwork)
     peer.getaddr(GETADDR_WINDOW).await
 }
 
-/// The circuit of one server: fixed SOCKS credentials while it answers, and whether its
-/// genesis block was checked on it (Esplora asks once; Electrum's features carry it).
+/// The circuit of one server: fixed SOCKS credentials while it answers.
 struct Circuit {
     isolation: Isolation,
-    genesis_ok: bool,
 }
 
 impl Circuit {
     fn new() -> Self {
-        Self { isolation: Isolation::fresh(), genesis_ok: false }
+        Self { isolation: Isolation::fresh() }
     }
 
     /// A server that did not answer gets new credentials: Tor would queue the next probe behind
     /// a stuck onion connection on the old ones (measured: four rounds, while new ones got in).
-    fn after(&mut self, state: State, checked: bool) {
-        match state {
-            State::Ok if checked => self.genesis_ok = true,
-            State::WrongNetwork => self.genesis_ok = false,
-            State::Unreachable => *self = Self::new(),
-            _ => {}
+    fn after(&mut self, state: State) {
+        if state == State::Unreachable {
+            *self = Self::new();
         }
     }
 }
@@ -225,23 +220,22 @@ async fn cycle(node: &Node, prober: &mut Prober) {
         node.record(t, Health::no_route(why, now()));
     }
     prober.circuits.retain(|t, _| targets.contains(t));
-    let jobs: Vec<(Target, Isolation, bool)> = targets
+    let jobs: Vec<(Target, Isolation)> = targets
         .into_iter()
         .map(|t| {
-            let c = prober.circuits.entry(t.clone()).or_insert_with(Circuit::new);
-            let (iso, check) = (c.isolation.clone(), !c.genesis_ok);
-            (t, iso, check)
+            let iso = prober.circuits.entry(t.clone()).or_insert_with(Circuit::new).isolation.clone();
+            (t, iso)
         })
         .collect();
     let mut results = stream::iter(jobs)
-        .map(|(t, iso, check)| async move {
-            let h = probe(&t, &iso, check).await;
-            (t, h, check)
+        .map(|(t, iso)| async move {
+            let h = probe(&t, &iso).await;
+            (t, h)
         })
         .buffer_unordered(MAX_CONCURRENT);
-    while let Some((t, h, checked)) = results.next().await {
+    while let Some((t, h)) = results.next().await {
         if let Some(c) = prober.circuits.get_mut(&t) {
-            c.after(h.state, checked);
+            c.after(h.state);
         }
         node.record(&t, h);
     }
@@ -249,7 +243,7 @@ async fn cycle(node: &Node, prober: &mut Prober) {
 }
 
 /// Probes one server on its route with address-free calls only.
-pub async fn probe(t: &Target, iso: &Isolation, check_genesis: bool) -> Health {
+pub async fn probe(t: &Target, iso: &Isolation) -> Health {
     let proxy = match t.proxy.as_deref().map(ProxyAddr::parse).transpose() {
         Ok(p) => p,
         Err(e) => return Health::unreachable(e, now()),
@@ -259,9 +253,8 @@ pub async fn probe(t: &Target, iso: &Isolation, check_genesis: bool) -> Health {
     let attempt = async {
         match t.kind {
             Kind::Electrum => electrum::probe(&t.url, t.route, proxy.as_ref(), iso, pin).await,
-            Kind::Rpc => crate::net::rpc::probe(&t.url, creds, t.route, proxy.as_ref(), iso, pin).await,
-            Kind::Esplora => esplora::probe(&t.url, creds, t.route, proxy.as_ref(), iso, check_genesis, pin).await,
-            Kind::Kyoto | Kind::Local => (Err("not probed by this module".into()), None),
+            Kind::Rpc => rpc::probe(&t.url, creds, t.route, proxy.as_ref(), iso, pin).await,
+            Kind::Kyoto | Kind::Local | Kind::Esplora => (Err("not probed by this module".into()), None),
         }
     };
     match tokio::time::timeout(PROBE_TIMEOUT, attempt).await {
@@ -291,13 +284,13 @@ mod tests {
         let mut held = Vec::new();
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while held.len() < 3 && Instant::now() < deadline {
+        while held.len() < 2 && Instant::now() < deadline {
             match listener.accept() {
                 Ok((s, _)) => held.push(s),
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
-        assert_eq!(held.len(), 3, "one fee server per network, dialled at once");
+        assert_eq!(held.len(), 2, "one fee server on mainnet and testnet4, dialled at once");
         let started = Instant::now();
         assert!(poller.stop(Duration::from_millis(1000)), "joined");
         assert!(started.elapsed() < Duration::from_millis(1000));
@@ -308,10 +301,10 @@ mod tests {
         use crate::net::cert::tests::{V1, V1_KEY, V3, V3_KEY};
         use crate::net::client::tests::{pin_of, tls_server};
         let electrum = tls_server(V1, V1_KEY, false).await;
-        let esplora = tls_server(V3, V3_KEY, false).await;
+        let rpc = tls_server(V3, V3_KEY, false).await;
         for (kind, url, cert) in [
             (Kind::Electrum, format!("ssl://127.0.0.1:{electrum}"), V1),
-            (Kind::Esplora, format!("https://127.0.0.1:{esplora}/api"), V3),
+            (Kind::Rpc, format!("https://127.0.0.1:{rpc}"), V3),
         ] {
             let t = Target {
                 network: crate::network::BNetwork::Mainnet,
@@ -323,15 +316,15 @@ mod tests {
                 credentials: None,
                 cert_sha256: Some(hex::encode(pin_of(cert))),
             };
-            let h = probe(&t, &Isolation::fresh(), true).await;
+            let h = probe(&t, &Isolation::fresh()).await;
             assert_eq!((h.state, h.tip_height), (State::Ok, Some(970_838)), "{kind:?}: {:?}", h.error);
             assert!(h.certificate.as_ref().is_some_and(|c| c.trusted && c.cert_sha256 == hex::encode(pin_of(cert))));
-            let wrong = probe(&Target { cert_sha256: Some("ab".repeat(32)), ..t.clone() }, &Isolation::fresh(), true).await;
+            let wrong = probe(&Target { cert_sha256: Some("ab".repeat(32)), ..t.clone() }, &Isolation::fresh()).await;
             assert_eq!(wrong.state, State::Unreachable, "{kind:?}");
             assert!(wrong.error.as_deref().is_some_and(|e| e.contains("not the pinned one")), "{:?}", wrong.error);
             assert!(wrong.certificate.is_some_and(|c| !c.trusted && c.cert_sha256 == hex::encode(pin_of(cert))), "offered to pin anew");
             // Unpinned, the web PKI refuses the self-signed certificate and the probe shows it.
-            let unpinned = probe(&Target { cert_sha256: None, ..t }, &Isolation::fresh(), true).await;
+            let unpinned = probe(&Target { cert_sha256: None, ..t }, &Isolation::fresh()).await;
             let c = unpinned.certificate.expect("shown for Trust this certificate?");
             assert_eq!((unpinned.state, c.trusted), (State::Unreachable, false));
         }
@@ -341,10 +334,11 @@ mod tests {
     fn a_server_that_did_not_answer_gets_a_new_circuit() {
         let mut c = Circuit::new();
         let first = c.isolation.clone();
-        c.after(State::Ok, true);
-        assert_eq!((&c.isolation, c.genesis_ok), (&first, true), "kept while it answers");
-        c.after(State::Unreachable, false);
-        assert!(c.isolation != first && !c.genesis_ok, "new credentials, genesis asked again");
+        c.after(State::Ok);
+        c.after(State::WrongNetwork);
+        assert_eq!(c.isolation, first, "kept while it answers");
+        c.after(State::Unreachable);
+        assert!(c.isolation != first, "new credentials");
     }
 
     #[test]
@@ -360,9 +354,9 @@ mod tests {
             credentials: None,
             cert_sha256: None,
         };
-        let h = rt.block_on(probe(&t, &Isolation::fresh(), false));
+        let h = rt.block_on(probe(&t, &Isolation::fresh()));
         assert_eq!(h.state, State::Unreachable);
         let t = Target { proxy: None, ..t };
-        assert_eq!(rt.block_on(probe(&t, &Isolation::fresh(), false)).error.as_deref(), Some("not probed by this module"));
+        assert_eq!(rt.block_on(probe(&t, &Isolation::fresh())).error.as_deref(), Some("not probed by this module"));
     }
 }
