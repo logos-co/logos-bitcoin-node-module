@@ -548,9 +548,10 @@ fn local_node() {
     assert_eq!(v(h.node.local_node("signet"))["error"], "bitcoind_module is not installed");
     h.node.set_source("signet", LOCAL_ID, r#"{"use":true}"#);
     let rt = v(h.node.route_table("signet"));
-    assert_eq!(ids(&rt, "chain"), ["local", "kyoto"]);
+    assert_eq!(ids(&rt, "chain"), ["local"], "your node alone; Kyoto's switch stays on");
     assert_eq!(rt["chain"][0]["url"], LOCAL_URL);
-    assert_eq!((ids(&rt, "pending"), ids(&rt, "broadcast")), (vec!["local".to_string()], vec!["local".to_string(), "kyoto".into()]));
+    assert_eq!((ids(&rt, "pending"), ids(&rt, "broadcast")), (vec!["local".to_string()], vec!["local".to_string()]));
+    assert_eq!(rt["unrouted"], json!([{"id": "kyoto", "reason": OWN_NODE}]));
     h.node.set_local_status(Arc::new(FakeLocal(json!({"state": "running", "network": "signet", "blocks": 270000}))));
     let st = v(h.node.local_node("signet"));
     assert_eq!((&st["enabled"], &st["available"], &st["status"]["blocks"]), (&json!(true), &json!(true), &json!(270000)));
@@ -858,4 +859,92 @@ fn identifying_splits_kyoto_once_both_books_have_peers() {
     assert!(v(h.node.route_table("signet"))["kyotoSplit"].is_object());
     h.node.set_own_peers("signet", r#"["192.168.1.20"]"#);
     assert_eq!(v(h.node.route_table("signet"))["kyotoSplit"], Value::Null);
+}
+
+/// Your node on: no peer, server or seed is contacted, and the other switches are kept, so
+/// turning it off brings them back.
+#[test]
+fn your_node_alone_makes_no_other_request() {
+    let h = configured();
+    let (proxy, socks) = fake_socks();
+    let electrum = TcpListener::bind("127.0.0.1:0").unwrap();
+    electrum.set_nonblocking(true).unwrap();
+    for net in ["mainnet", "testnet4"] {
+        h.node.set_sources(net, "[]");
+    }
+    let o = onion();
+    let list = json!([
+        {"id": "kyoto", "kind": "kyoto"},
+        {"id": "home", "kind": "electrum", "url": format!("tcp://127.0.0.1:{}", electrum.local_addr().unwrap().port()), "history": true},
+        {"id": "hidden", "kind": "electrum", "url": format!("{o}:110")},
+        {"id": "local", "kind": "local"},
+    ]);
+    let s = v(h.node.set_sources("signet", &list.to_string()));
+    assert_eq!((&s["exposes"], &s["withoutTor"]), (&json!([]), &json!([])), "{s}");
+    h.node.set_proxy(&proxy);
+    let rt = v(h.node.route_table("signet"));
+    for role in ["chain", "history", "pending", "fees", "broadcast"] {
+        assert_eq!(ids(&rt, role), ["local"], "{role}");
+    }
+    assert!(ids(&rt, "check").is_empty() && rt["peers"] == json!([]) && rt["proxy"].is_null(), "{rt}");
+    let waiting: Vec<(&str, &str)> = rt["unrouted"].as_array().unwrap().iter().map(|u| (u["id"].as_str().unwrap(), u["reason"].as_str().unwrap())).collect();
+    assert_eq!(waiting, [("kyoto", OWN_NODE), ("home", OWN_NODE), ("hidden", OWN_NODE)]);
+    let health = v(h.node.source_health("signet"));
+    assert_eq!((&health["pending"], &health["tor"]), (&json!(false), &Value::Null), "nothing to wait for, no Tor to show");
+    h.node.set_wallet_open("signet", true);
+    assert!(h.node.harvest_plan().is_empty(), "no seed is asked for peers");
+    let poller = crate::poll::Poller::start(h.node.clone()).unwrap();
+    assert_eq!(v(h.node.probe("signet", "home"))["error"], OWN_NODE);
+    let all = v(h.node.probe("signet", ""));
+    assert_eq!(all["answered"], true);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(electrum.accept().is_err(), "the Electrum server was never dialled");
+    assert!(socks.lock().unwrap().is_empty(), "nothing went to Tor: {:?}", socks.lock().unwrap());
+    // Off again: the servers' switches are as they were, and they are probed at once.
+    h.node.set_wallet_open("signet", false);
+    let s = v(h.node.set_source("signet", LOCAL_ID, r#"{"use":false}"#));
+    assert_eq!(s["exposes"][0]["id"], "home", "History is still on");
+    let mut dialled = false;
+    wait_until("the Electrum server to be probed", 10, || {
+        dialled |= electrum.accept().is_ok();
+        dialled && !socks.lock().unwrap().is_empty()
+    });
+    assert_eq!(ids(&v(h.node.route_table("signet")), "chain"), ["kyoto"]);
+    assert!(poller.stop(Duration::from_millis(1000)), "joined");
+}
+
+/// Use Tor for is for public sources: your node at an address takes its own Tor switch, and an
+/// onion address always goes through Tor.
+#[test]
+fn your_node_at_an_address_follows_its_own_tor_switch() {
+    let h = configured();
+    h.node.set_tor_use("none");
+    assert!(!h.node.uses_built_in_tor());
+    let o = onion();
+    let list = json!([{"id": "kyoto", "kind": "kyoto"}, {"id": "mine", "kind": "rpc", "url": "https://node.example", "tor": true},
+                      {"id": "hidden", "kind": "rpc", "url": format!("http://{o}:8332"), "use": false}]);
+    assert_eq!(v(h.node.set_sources("signet", &list.to_string()))["ok"], true);
+    assert!(h.node.uses_built_in_tor(), "tor_module is asked for your node");
+    let rt = v(h.node.route_table("signet"));
+    assert_eq!((ids(&rt, "chain"), route_of(&rt, "chain", "mine"), &rt["proxy"]), (vec!["mine".to_string()], "tor".into(), &json!(TOR)));
+    assert_eq!(v(h.node.source_health("signet"))["tor"]["state"], "ready", "its Tor shows");
+    let (targets, _) = h.node.poll_plan();
+    let mine: Vec<(&str, Route, Option<&str>)> = targets.iter().filter(|t| t.network == BNetwork::Signet).map(|t| (t.id.as_str(), t.route, t.proxy.as_deref())).collect();
+    assert_eq!(mine, [("mine", Route::Tor, Some(TOR))]);
+    // At an onion address.
+    h.node.set_source("signet", "mine", r#"{"use":false}"#);
+    h.node.set_source("signet", "hidden", r#"{"use":true}"#);
+    let rt = v(h.node.route_table("signet"));
+    assert_eq!((ids(&rt, "chain"), route_of(&rt, "chain", "hidden"), &rt["unrouted"]), (vec!["hidden".to_string()], "onion".into(), &json!([{"id": "kyoto", "reason": OWN_NODE}])));
+    // Its switch off: direct, which a public address needs TLS for; no Tor is asked.
+    h.node.set_source("signet", "hidden", r#"{"use":false}"#);
+    let s = v(h.node.set_source("signet", "mine", r#"{"use":true,"tor":false}"#));
+    assert_eq!(s["withoutTor"][0]["id"], "mine");
+    assert!(!h.node.uses_built_in_tor());
+    let rt = v(h.node.route_table("signet"));
+    assert_eq!((route_of(&rt, "chain", "mine"), &rt["proxy"]), ("direct".into(), &Value::Null));
+    assert_eq!(v(h.node.source_health("signet"))["tor"], Value::Null);
+    // Public sources again: Use Tor for applies, so Kyoto dials directly.
+    h.node.set_source("signet", "mine", r#"{"use":false}"#);
+    assert_eq!(route_of(&v(h.node.route_table("signet")), "chain", "kyoto"), "direct");
 }

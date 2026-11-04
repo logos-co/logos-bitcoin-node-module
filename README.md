@@ -23,13 +23,18 @@ the route are computed. Kinds:
 
 - `local` and `rpc` are your node, in Logos or at an address. At most one of them is on per
   network: `Enable only one node at a time: the local node or one Bitcoin Core RPC endpoint`.
+- While your node is on, the wallet asks it alone: Kyoto and every server leave every role,
+  `exposes`, `withoutTor`, the health poll and the peer harvest, and `probe` refuses them with
+  `your node is in use: the wallet asks it alone`. Their switches stay as set, so turning your
+  node off brings them back as they were.
 - `esplora` is refused: `invalid parameters: <id>: Esplora servers are no longer supported; use
   an Electrum server`. A store from before version 4 moves its Esplora entries (Store, below).
 - `history` means the source is asked about the wallet's addresses. Electrum only; your node
   never receives wallet addresses. Every reply that changes sources carries `exposes`, the
-  enabled sources that learn the addresses.
+  sources in use that learn the addresses.
 - `tor` is per source and on by default. Turning it off is refused for an onion service. A
-  source reached without Tor by choice is listed in `withoutTor`.
+  source reached without Tor by choice is listed in `withoutTor`. Your node at an address keeps
+  its own `tor` whatever Use Tor for says (below).
 - A server on your own network is reached directly: loopback, private, CGNAT, link-local and
   IPv6 unique-local addresses, and `.local`, `.lan`, `.home.arpa` and `.internal` names that
   resolve only to such addresses. The rules are the Zcash node module's `net/client.rs`.
@@ -127,6 +132,11 @@ false. `config_status`, `get_sources` and `source_health` carry both.
   tor_module is never asked, so `source_health.tor` is null and Bitcoin leaves the Tor app's
   "Apps using Tor".
 
+Use Tor for is for public sources. Your node at an address (`rpc`) goes through Tor when its own
+`tor` is on, and always at an onion address, in every mode: then `route_table.proxy` is the
+proxy, tor_module is asked, and `source_health.tor` shows it. While your node is on, the table's
+`proxy` is set only for that, and `source_health.tor` only then.
+
 A version 3 store keeps `torUse` and `torUseChosen`. A fresh store starts at `identifying`, not
 chosen; a version 1 or 2 store loads as `all`, not chosen, so an upgrade never weakens its
 routing. Older builds set a version 3 store aside as unreadable, as they did version 2.
@@ -139,23 +149,23 @@ its SOCKS port is off (the Tor app turns it on), or it is not available. `source
 ## Routes
 
 `route_table(network)` gives one list per role, each `{ id, kind, url, operator, route }` with
-`route` `tor`, `direct` or `onion`, in failover order:
+`route` `tor`, `direct` or `onion`, in failover order. While your node is on, every role but
+`check` is your node alone and `check` is empty; otherwise:
 
-- `chain`: your node, then Kyoto; only when neither is on, every Electrum server (the
-  most-work chain wins). It follows what is switched on, so an unreachable Kyoto never hands
-  the chain to a server.
-- `history`: your node and Kyoto, which learn no address, then servers with history on.
-- `pending`: your node, then servers with history on.
-- `fees`: your node, every Electrum server, then Kyoto (the relay floor).
-- `broadcast`: your node, then Kyoto; only when neither is on, the history servers.
+- `chain`: Kyoto; only when it is off, every Electrum server (the most-work chain wins). It
+  follows what is switched on, so an unreachable Kyoto never hands the chain to a server.
+- `history`: Kyoto, which learns no address, then servers with history on.
+- `pending`: servers with history on.
+- `fees`: every Electrum server, then Kyoto (the relay floor).
+- `broadcast`: Kyoto; only when it is off, the history servers.
 - `check`: every Electrum server, asked for tips and headers only.
 
 RPC credentials are stored owner-only, and only the wallet core reads them, with
 `source_credentials`.
 
 Plus `proxy` (the SOCKS URL to dial; for `tor`, tor_module's port), `peers` (Kyoto's peers,
-below), `unrouted` (enabled sources left out, and why: no Tor route, suspect, wrong network),
-`torUse`, and `kyotoSplit`. There is no `crossCheck` any more: an older core only printed it.
+below), `unrouted` (enabled sources left out, and why: your node is in use, no Tor route,
+suspect, wrong network), `torUse`, and `kyotoSplit`. There is no `crossCheck` any more: an older core only printed it.
 
 `kyotoSplit` is set only in `identifying`, with Kyoto on the books (no own peers) and its Tor
 switch on, once both books have usable peers: `{ chain: { route: "direct", peers }, tor: {
@@ -218,8 +228,9 @@ Kyoto. When fewer than 12 usable peers worked in the last 30 days, the health th
 8 seeds over Tor (version handshake, `sendaddrv2`, one `getaddr`) and keeps what they gossip by
 the rules above, as learned with `from` the seed: a day after a harvest a seed answered, an hour
 after one none answered (at most 3 tries a day), and only while a wallet is open on that
-network, with Kyoto on, no own peers and a proxy. On regtest, `regtest.json` may name loopback
-or LAN seeds, reached directly: `{ "harvestSeeds": ["127.0.0.1:18444"] }`.
+network, with Kyoto in use (not while your node is on), no own peers and a proxy. On regtest,
+`regtest.json` may name loopback or LAN seeds, reached directly:
+`{ "harvestSeeds": ["127.0.0.1:18444"] }`.
 
 Core 31.2's public IPv4 and IPv6 fixed seeds ship as `peer-lists/clearnet-seeds-<network>.json`
 and seed the clearnet book the same way. Its harvest runs only while Kyoto takes the chain
@@ -229,7 +240,7 @@ the system resolver and kept as learned with `from` `dns:<seed>`.
 
 ## Health
 
-The health thread probes every enabled server once a minute, four at a time, on one Tor
+The health thread probes every server in use once a minute, four at a time, on one Tor
 circuit per server: Electrum `server.version`, `server.features` (the genesis block) and
 `blockchain.headers.subscribe`; RPC `getblockchaininfo`, `getblockhash 0` and `getblockfilter`
 at the tip (filters available, or a full-block scan). A server that does not answer gets a new circuit next round,
