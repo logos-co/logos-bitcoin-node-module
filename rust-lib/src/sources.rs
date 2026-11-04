@@ -483,10 +483,24 @@ pub struct Roles {
     pub check: Vec<RouteEntry>,
 }
 
-/// The roles over the enabled sources `usable` admits, in failover order (README, Routes). The
-/// chain follows what is switched on, so an unreachable Kyoto never hands it to a server.
+/// Your node, in Logos or at an address.
+pub fn own_node(s: &Source) -> bool {
+    matches!(s.kind, Kind::Local | Kind::Rpc)
+}
+
+pub fn own_node_on(list: &[Source]) -> bool {
+    list.iter().any(|s| s.enabled && own_node(s))
+}
+
+/// Switched on and asked: while your node is on it is asked alone, and the other switches wait.
+pub fn in_use(list: &[Source], s: &Source) -> bool {
+    s.enabled && (own_node(s) || !own_node_on(list))
+}
+
+/// The roles over the sources in use that `usable` admits, in failover order (README, Routes).
+/// The chain follows what is switched on, so an unreachable Kyoto never hands it to a server.
 pub fn roles(list: &[Source], route: impl Fn(&Source) -> Route, usable: impl Fn(&Source) -> bool) -> Roles {
-    let on = |s: &Source| s.enabled && usable(s);
+    let on = |s: &Source| in_use(list, s) && usable(s);
     let entry = |s: &Source| RouteEntry {
         id: s.id.clone(),
         kind: s.kind,
@@ -529,17 +543,17 @@ fn named(s: &Source, lan: bool) -> Named {
     Named { id: s.id.clone(), url: s.url.clone(), operator: s.operator.clone(), lan }
 }
 
-/// The enabled sources that learn the wallet's addresses: every server with history on, in
+/// The sources in use that learn the wallet's addresses: every server with history on, in
 /// failover order, since each one asked after a failure learns them too.
 pub fn exposes(list: &[Source], lan: impl Fn(&Source) -> bool) -> Vec<Named> {
-    list.iter().filter(|s| s.enabled && s.history && s.kind.is_server()).map(|s| named(s, lan(s))).collect()
+    list.iter().filter(|s| in_use(list, s) && s.history && s.kind.is_server()).map(|s| named(s, lan(s))).collect()
 }
 
-/// The enabled sources outside the user's network reached without Tor, by the user's choice:
+/// The sources in use outside the user's network reached without Tor, by the user's choice:
 /// they see this computer's IP address.
 pub fn without_tor(list: &[Source], route: impl Fn(&Source) -> Route, lan: impl Fn(&Source) -> bool) -> Vec<Named> {
     list.iter()
-        .filter(|s| s.enabled && s.kind != Kind::Local && route(s) == Route::Direct && !lan(s))
+        .filter(|s| in_use(list, s) && s.kind != Kind::Local && route(s) == Route::Direct && !lan(s))
         .map(|s| named(s, false))
         .collect()
 }
@@ -618,12 +632,25 @@ mod tests {
     fn the_chain_follows_what_is_switched_on() {
         let mut list = defaults(BNetwork::Mainnet);
         list.iter_mut().for_each(|s| s.enabled = true);
+        list.iter_mut().filter(|s| s.kind == Kind::Electrum).for_each(|s| s.history = true);
+        // Your node on: it alone, in every role; the other switches stay as they were.
         let r = roles(&list, server_route, all);
-        assert_eq!(ids(&r.chain), ["local", "kyoto"]);
-        assert_eq!(ids(&r.broadcast), ["local", "kyoto"]);
-        assert_eq!(ids(&r.pending), ["local"], "no server has history on");
+        for role in [&r.chain, &r.history, &r.pending, &r.fees, &r.broadcast] {
+            assert_eq!(ids(role), ["local"]);
+        }
+        assert!(r.check.is_empty());
+        assert!(exposes(&list, lan).is_empty() && list.iter().filter(|s| s.enabled).count() == 4);
+        // Your node unreachable: nothing, rather than a peer or a server.
+        let r = roles(&list, server_route, |s| s.kind != Kind::Local);
+        assert!([&r.chain, &r.history, &r.pending, &r.fees, &r.broadcast, &r.check].iter().all(|x| x.is_empty()));
+        // The node off: Kyoto and the servers, as switched.
+        list.iter_mut().filter(|s| s.kind == Kind::Local).for_each(|s| s.enabled = false);
+        list.iter_mut().filter(|s| s.kind == Kind::Electrum).for_each(|s| s.history = false);
+        let r = roles(&list, server_route, all);
+        assert_eq!((ids(&r.chain), ids(&r.broadcast)), (vec!["kyoto"], vec!["kyoto"]));
+        assert!(r.pending.is_empty(), "no server has history on");
         // Kyoto unreachable: the chain stays empty rather than move to a server.
-        let r = roles(&list, server_route, |s| s.kind != Kind::Kyoto && s.kind != Kind::Local);
+        let r = roles(&list, server_route, |s| s.kind != Kind::Kyoto);
         assert!(r.chain.is_empty() && r.broadcast.is_empty());
         // Kyoto and the node off: every Electrum server, and history servers broadcast.
         list.iter_mut().filter(|s| !s.kind.is_server()).for_each(|s| s.enabled = false);
@@ -634,6 +661,21 @@ mod tests {
         assert_eq!(r.check.len(), 2);
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["broadcast", "chain", "check", "fees", "history", "pending"], "no crossCheck");
+    }
+
+    #[test]
+    fn your_node_at_an_address_is_asked_alone() {
+        let mut list = defaults(BNetwork::Mainnet);
+        list.extend(parse_list(r#"[{"id":"mine","kind":"rpc","url":"https://node.example","tor":false},
+                                    {"id":"home","kind":"electrum","url":"192.168.1.20","history":true}]"#, &[]).unwrap());
+        let r = roles(&list, server_route, all);
+        for role in [&r.chain, &r.history, &r.pending, &r.fees, &r.broadcast] {
+            assert_eq!(ids(role), ["mine"]);
+        }
+        assert!(r.check.is_empty() && exposes(&list, lan).is_empty());
+        assert_eq!(without_tor(&list, server_route, lan).iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["mine"], "it sees this computer");
+        let used: Vec<&str> = list.iter().filter(|s| in_use(&list, s)).map(|s| s.id.as_str()).collect();
+        assert_eq!(used, ["mine"], "Kyoto, the fee server and the history server wait, switched on");
     }
 
     #[test]
