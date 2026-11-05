@@ -1,7 +1,7 @@
 {
   "name": "bitcoin_node_module",
   "display_name": "Bitcoin Sources",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "core",
   "interface": "cdylib",
   "concurrency": "multi",
@@ -9,8 +9,12 @@
   "description": "The Bitcoin wallet's sources per network: Kyoto peers, Electrum servers, and your node (in Logos or over RPC). Tor per source through one proxy, the Tor that comes with Logos (tor_module) by default, a route table per role, curated peer lists, and address-free health probes. Fail-closed: a source routed through Tor never falls back to a direct connection.",
   "author": "Logos Core Team",
   "main": "bitcoin_node_module_plugin",
-  "dependencies": ["tor_module"],
-  "optional_dependencies": ["bitcoind_module"],
+  "dependencies": [
+    { "name": "tor_module", "version": "~0.2.0" }
+  ],
+  "optional_dependencies": [
+    { "name": "bitcoind_module", "version": "~0.2.0" }
+  ],
   "include": [],
   "capabilities": [],
   "codegen": {
