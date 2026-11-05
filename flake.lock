@@ -8,11 +8,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1791677515,
-        "narHash": "sha256-x9hg2imiBMTF8ffAPyPiex/sM1hzeRZBb0fEEcFO30w=",
+        "lastModified": 1793890757,
+        "narHash": "sha256-xKRNIwXwM1XX7vB2catgjKAD6f0w4OmjA3CDpBe+wo8=",
         "owner": "logos-co",
         "repo": "logos-bitcoind-module",
-        "rev": "fb767757afaa8f80a9a56c7a9cf083c74ea21caa",
+        "rev": "56a7997a258c8520be3c40aea5cf51299cd31684",
         "type": "github"
       },
       "original": {
@@ -109,11 +109,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1791677303,
-        "narHash": "sha256-moGVmk/p2lrl5/vqh0YpSdw/jZzyWDQ+G/eEKgKuAHQ=",
+        "lastModified": 1793225498,
+        "narHash": "sha256-JPnY7Y4ZcWTDvi91sxsO4vMPv0BVuuMl+p3zpwXrzWM=",
         "owner": "logos-co",
         "repo": "logos-bitcoin-core-nix",
-        "rev": "eb0846bd8458d42b3e11098e906e338f3c48a0e4",
+        "rev": "eae192675e51e337f611073432af7f8766ca0a23",
         "type": "github"
       },
       "original": {
@@ -9731,11 +9731,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793233167,
-        "narHash": "sha256-PTDOQMk3JS8snEErsGS2cW6l+DspDoQt/G219Z/pnWg=",
+        "lastModified": 1793890854,
+        "narHash": "sha256-muOOOPaCRrDVx8mKRu2k93ISZK3CwVhpr/VUa63E9qQ=",
         "owner": "logos-co",
         "repo": "logos-tor-module",
-        "rev": "6fba1edd753758930ce0cbc9a854be7863fd35e0",
+        "rev": "8a2ff25e6229293431293d31ed50b3f3bc1dfebc",
         "type": "github"
       },
       "original": {
