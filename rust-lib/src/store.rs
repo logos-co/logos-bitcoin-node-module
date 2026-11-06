@@ -1,5 +1,5 @@
-//! What persists, written atomically and owner-only to `bitcoin_sources.json`: the proxy, what
-//! Tor is used for, and per network the sources, suspects, own peers and a fetched peer list.
+//! What persists, written atomically and owner-only to `bitcoin_sources.json`: the proxy, and per
+//! network what Tor is used for, the sources, suspects, own peers and a fetched peer list.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -16,8 +16,8 @@ use crate::strnum::{de, de_opt, double_option, ser, ser_opt};
 
 pub const FILE_NAME: &str = "bitcoin_sources.json";
 /// 2: the proxy may be `tor`, the Tor that comes with Logos. 3: `torUse` and `torUseChosen`.
-/// 4: no Esplora or PublicNode, and at most one node source on.
-pub const VERSION: u32 = 4;
+/// 4: no Esplora or PublicNode, and at most one node source on. 5: `torUse` per network.
+pub const VERSION: u32 = 5;
 
 /// Version 3's mainnet Esplora seeds, and the same operator's Electrum entry each moves to.
 const ESPLORA_TO_ELECTRUM: [(&str, &str, &str); 2] = [
@@ -73,11 +73,17 @@ pub struct NetConfig {
     /// Kyoto dials only these when there are any.
     #[serde(default)]
     pub own_peers: Vec<String>,
+    #[serde(default)]
+    pub tor_use: TorUse,
+    /// Set once the person picked `tor_use` for this network; until then the app asks first.
+    #[serde(default)]
+    pub tor_use_chosen: bool,
 }
 
 impl NetConfig {
+    /// A new network starts at `identifying`, not yet chosen.
     pub fn seeded(net: BNetwork) -> Self {
-        Self { sources: sources::defaults(net), suspects: BTreeMap::new(), own_peers: vec![] }
+        Self { sources: sources::defaults(net), suspects: BTreeMap::new(), own_peers: vec![], tor_use: TorUse::Identifying, tor_use_chosen: false }
     }
 
     pub fn source(&self, id: &str) -> Option<&Source> {
@@ -170,11 +176,11 @@ pub struct Store {
     pub salt: String,
     #[serde(default)]
     pub networks: BTreeMap<BNetwork, NetConfig>,
-    #[serde(default)]
-    pub tor_use: TorUse,
-    /// Set once the person picked `tor_use`; until then the app asks before any account.
-    #[serde(default)]
-    pub tor_use_chosen: bool,
+    /// Versions 3 and 4 kept one `torUse` for every network; read only to carry it over.
+    #[serde(default, skip_serializing)]
+    pub tor_use: Option<TorUse>,
+    #[serde(default, skip_serializing)]
+    pub tor_use_chosen: Option<bool>,
 }
 
 pub enum Loaded {
@@ -190,10 +196,9 @@ fn fresh_salt() -> String {
 }
 
 impl Store {
-    /// Nothing configured: the backend calls init_defaults. A new install starts at
-    /// `identifying`, not yet chosen.
+    /// Nothing configured: the backend calls init_defaults.
     pub fn empty() -> Self {
-        Self { version: VERSION, proxy: None, salt: fresh_salt(), networks: BTreeMap::new(), tor_use: TorUse::Identifying, tor_use_chosen: false }
+        Self { version: VERSION, proxy: None, salt: fresh_salt(), networks: BTreeMap::new(), tor_use: None, tor_use_chosen: None }
     }
 
     /// Version 1's default, a Tor the user had to run, becomes the Tor that comes with Logos,
@@ -204,11 +209,19 @@ impl Store {
             self.proxy = Some(Some(proxy::BUILT_IN.into()));
         }
         if self.version < 3 {
-            (self.tor_use, self.tor_use_chosen) = (TorUse::All, false);
+            self.tor_use = Some(TorUse::All);
         }
         if self.version < 4 {
             self.networks.iter_mut().for_each(|(net, cfg)| cfg.upgrade_to_4(*net));
         }
+        // The one choice becomes each network's, asked again per network with it preselected.
+        if self.version < 5 {
+            let legacy = self.tor_use.unwrap_or_default();
+            for cfg in self.networks.values_mut() {
+                (cfg.tor_use, cfg.tor_use_chosen) = (legacy, false);
+            }
+        }
+        (self.tor_use, self.tor_use_chosen) = (None, None);
         self.version = VERSION;
     }
 
@@ -581,33 +594,44 @@ mod tests {
     }
 
     #[test]
-    fn tor_use_starts_at_identifying_and_older_files_load_as_all() {
+    fn tor_use_is_per_network_and_older_files_carry_theirs_to_each() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
-        let fresh = Store::load_or_empty(&path);
-        assert_eq!((fresh.tor_use, fresh.tor_use_chosen), (TorUse::Identifying, false));
+        let fresh = configured();
+        assert!(fresh.networks.values().all(|c| (c.tor_use, c.tor_use_chosen) == (TorUse::Identifying, false)));
+        fresh.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 4") && text.contains("\"torUse\": \"identifying\"") && text.contains("\"torUseChosen\": false"), "{text}");
+        assert!(text.contains("\"version\": 5") && text.contains("\"torUse\": \"identifying\"") && text.contains("\"torUseChosen\": false"), "{text}");
+        let top: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(top.get("torUse").is_none() && top.get("torUseChosen").is_none(), "{text}");
+
+        // Version 4 kept one choice: each network gets it, to be confirmed per network.
+        let mut v4 = serde_json::to_value(configured()).unwrap();
+        v4["version"] = 4.into();
+        v4["torUse"] = "none".into();
+        v4["torUseChosen"] = true.into();
+        for cfg in v4["networks"].as_object_mut().unwrap().values_mut() {
+            cfg.as_object_mut().unwrap().retain(|k, _| k != "torUse" && k != "torUseChosen");
+        }
+        std::fs::write(&path, v4.to_string()).unwrap();
+        let Loaded::Found(up) = Store::load(&path) else { panic!() };
+        assert_eq!(up.version, VERSION);
+        assert!(up.networks.values().all(|c| (c.tor_use, c.tor_use_chosen) == (TorUse::None, false)));
 
         // A version 2 file, which has neither field: everything stays on Tor, the choice still to make.
-        let mut v2 = serde_json::to_value(configured()).unwrap();
+        let mut v2 = v4.clone();
         v2["version"] = 2.into();
-        v2.as_object_mut().unwrap().retain(|k, _| k != "torUse" && k != "torUseChosen");
-        std::fs::write(&path, v2.to_string()).unwrap();
-        let Loaded::Found(up) = Store::load(&path) else { panic!() };
-        assert_eq!((up.version, up.tor_use, up.tor_use_chosen), (VERSION, TorUse::All, false));
-        // Even one that somehow says otherwise.
-        v2["torUse"] = "none".into();
-        v2["torUseChosen"] = true.into();
-        std::fs::write(&path, v2.to_string()).unwrap();
-        let Loaded::Found(up) = Store::load(&path) else { panic!() };
-        assert_eq!((up.tor_use, up.tor_use_chosen), (TorUse::All, false));
+        let Loaded::Found(up) = ({ std::fs::write(&path, v2.to_string()).unwrap(); Store::load(&path) }) else { panic!() };
+        assert!(up.networks.values().all(|c| (c.tor_use, c.tor_use_chosen) == (TorUse::All, false)));
 
+        // Each network keeps its own.
         let mut chosen = configured();
-        (chosen.tor_use, chosen.tor_use_chosen) = (TorUse::None, true);
+        let main = chosen.networks.get_mut(&BNetwork::Mainnet).unwrap();
+        (main.tor_use, main.tor_use_chosen) = (TorUse::None, true);
         chosen.save(&path).unwrap();
         let Loaded::Found(back) = Store::load(&path) else { panic!() };
-        assert_eq!(back, chosen);
+        assert_eq!(back.networks, chosen.networks);
+        assert_eq!((back.networks[&BNetwork::Signet].tor_use, back.networks[&BNetwork::Signet].tor_use_chosen), (TorUse::Identifying, false));
         std::fs::write(&path, std::fs::read_to_string(&path).unwrap().replace("\"none\"", "\"some\"")).unwrap();
         assert!(matches!(Store::load(&path), Loaded::Corrupt(_)));
         assert_eq!([TorUse::parse("all"), TorUse::parse(" none "), TorUse::parse("everything")], [Some(TorUse::All), Some(TorUse::None), None]);

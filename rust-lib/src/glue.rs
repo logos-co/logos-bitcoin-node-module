@@ -17,7 +17,7 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// holds regtest.json.
     fn list_networks(&self) -> String;
     /// `{ ok, state: unconfigured|unready|configured, configured, unconfigured, proxySet, walletOpen,
-    /// torUse, torUseChosen }`.
+    /// torUse, torUseChosen }`, the last two by network name.
     fn config_status(&self) -> String;
     /// Fills what is absent: the Tor proxy, and each network's sources (Kyoto on, one Electrum
     /// server for fee rates but on signet, every other source off). `{ ok, applied }`. Backend only.
@@ -40,11 +40,11 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// user's own at socks5h://host:port; empty clears it, which leaves every source routed
     /// through Tor without a route. Backend only; refused while a wallet is open.
     fn set_proxy(&self, proxy: String) -> String;
-    /// What Tor carries, for every network: `all`, `identifying` (headers and filters direct,
-    /// matched blocks and broadcasts over Tor) or `none` (Tor off, onion sources unrouted); it
-    /// sets `torUseChosen`. `{ ok, torUse, torUseChosen }`. Backend only; refused while any
-    /// wallet is open.
-    fn set_tor_use(&self, mode: String) -> String;
+    /// What Tor carries on `network`: `all`, `identifying` (headers and filters direct, matched
+    /// blocks and broadcasts over Tor) or `none` (Tor off, onion sources unrouted); it sets that
+    /// network's `torUseChosen`. `{ ok, network, torUse, torUseChosen }`. Backend only; refused
+    /// while any wallet is open.
+    fn set_tor_use(&self, network: String, mode: String) -> String;
     /// Whether a wallet is open on `network`, which locks its settings. Backend only.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
     /// `{ ok, network, proxy, chain, history, pending, fees, broadcast, check, peers, unrouted,
@@ -160,8 +160,8 @@ impl BitcoinNodeModule for BitcoinNodeModuleImpl {
         self.gated(Access::Backend, |n| n.set_proxy(&proxy))
     }
 
-    fn set_tor_use(&self, mode: String) -> String {
-        self.gated(Access::Backend, |n| n.set_tor_use(&mode))
+    fn set_tor_use(&self, network: String, mode: String) -> String {
+        self.gated(Access::Backend, |n| n.set_tor_use(&network, &mode))
     }
 
     fn set_wallet_open(&self, network: String, open: bool) -> String {

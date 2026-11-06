@@ -175,7 +175,7 @@ impl Inner {
     /// A source's route; with `torUse` none every switch reads off, and an onion stays onion.
     /// Your node at an address follows its own switch: Use Tor for is for public sources.
     fn route_of(&self, cfg: &NetConfig, s: &Source) -> Route {
-        let tor = s.tor && (s.kind == Kind::Rpc || self.tor_on());
+        let tor = s.tor && (s.kind == Kind::Rpc || cfg.tor_use.tor());
         match s.kind {
             Kind::Local => Route::Direct,
             Kind::Kyoto if !tor && cfg.own_peers.iter().any(|p| is_onion(peer_host(p))) => Route::Onion,
@@ -184,13 +184,14 @@ impl Inner {
         }
     }
 
-    fn tor_on(&self) -> bool {
-        self.store.tor_use.tor()
-    }
-
     /// Kyoto dials the onion book: Tor is used and Kyoto's switch is on. Regtest has one book.
     fn kyoto_onion(&self, net: BNetwork, cfg: &NetConfig) -> bool {
-        net == BNetwork::Regtest || (self.tor_on() && cfg.kyoto_tor())
+        net == BNetwork::Regtest || (cfg.tor_use.tor() && cfg.kyoto_tor())
+    }
+
+    /// A network the person set up, or one with a wallet open: nothing else is probed.
+    fn in_play(&self, net: BNetwork, cfg: &NetConfig) -> bool {
+        cfg.tor_use_chosen || self.wallet_open.contains(&net)
     }
 
     fn lan_of(cfg: &NetConfig, s: &Source) -> bool {
@@ -201,9 +202,9 @@ impl Inner {
         }
     }
 
-    /// Where Tor routes dial: the user's own Tor, or the built-in one's SOCKS port while it has one.
-    fn dial_proxy(&self) -> Option<&str> {
-        if !self.tor_on() {
+    /// Where `cfg`'s Tor routes dial: the user's own Tor, or the built-in one's SOCKS port while it has one.
+    fn dial_proxy(&self, cfg: &NetConfig) -> Option<&str> {
+        if !cfg.tor_use.tor() {
             return None;
         }
         self.tor_proxy()
@@ -218,8 +219,8 @@ impl Inner {
     }
 
     /// Where `s` dials through Tor: your node at an address reaches Tor under any Use Tor for.
-    fn dial_proxy_for(&self, s: &Source) -> Option<&str> {
-        if s.kind == Kind::Rpc { self.tor_proxy() } else { self.dial_proxy() }
+    fn dial_proxy_for(&self, cfg: &NetConfig, s: &Source) -> Option<&str> {
+        if s.kind == Kind::Rpc { self.tor_proxy() } else { self.dial_proxy(cfg) }
     }
 
     /// Your node on `cfg`, switched on and routed through Tor.
@@ -229,12 +230,12 @@ impl Inner {
 
     /// Whether `cfg`'s sources in use go through Tor: your node's own switch, else Use Tor for.
     fn uses_tor(&self, cfg: &NetConfig) -> bool {
-        if sources::own_node_on(&cfg.sources) { self.own_node_tor(cfg) } else { self.tor_on() }
+        if sources::own_node_on(&cfg.sources) { self.own_node_tor(cfg) } else { cfg.tor_use.tor() }
     }
 
     /// Why Tor routes have nowhere to dial.
-    fn no_proxy(&self, s: &Source) -> &'static str {
-        if !self.tor_on() && s.kind != Kind::Rpc {
+    fn no_proxy(&self, cfg: &NetConfig, s: &Source) -> &'static str {
+        if !cfg.tor_use.tor() && s.kind != Kind::Rpc {
             return TOR_OFF;
         }
         match (self.store.proxy(), &self.tor) {
@@ -260,7 +261,7 @@ impl Inner {
     /// Fail closed: a source whose route goes through Tor has none without the proxy.
     fn blocked(&self, cfg: &NetConfig, s: &Source) -> Option<&'static str> {
         let tor = matches!(self.route_of(cfg, s), Route::Tor | Route::Onion);
-        (tor && self.dial_proxy_for(s).is_none()).then(|| self.no_proxy(s))
+        (tor && self.dial_proxy_for(cfg, s).is_none()).then(|| self.no_proxy(cfg, s))
     }
 
     /// Why a source gets no route, if it gets none.
@@ -295,7 +296,7 @@ impl Inner {
 
     fn target(&self, net: BNetwork, cfg: &NetConfig, s: &Source) -> Target {
         let route = self.route_of(cfg, s);
-        let proxy = matches!(route, Route::Tor | Route::Onion).then(|| self.dial_proxy_for(s).map(String::from)).flatten();
+        let proxy = matches!(route, Route::Tor | Route::Onion).then(|| self.dial_proxy_for(cfg, s).map(String::from)).flatten();
         Target {
             network: net,
             id: s.id.clone(),
@@ -336,7 +337,7 @@ impl Inner {
     /// matched blocks and broadcasts as onion errands. None until both books have peers, so
     /// Kyoto stays all-Tor meanwhile; an older core ignores the key and stays all-Tor too.
     fn kyoto_split(&self, net: BNetwork, cfg: &NetConfig) -> Option<Value> {
-        if self.store.tor_use != TorUse::Identifying || !cfg.own_peers.is_empty() || !cfg.kyoto_tor() || net == BNetwork::Regtest {
+        if cfg.tor_use != TorUse::Identifying || !cfg.own_peers.is_empty() || !cfg.kyoto_tor() || net == BNetwork::Regtest {
             return None;
         }
         let (chain, tor) = (self.clear_usable(net), self.onion_usable(net, true));
@@ -394,7 +395,7 @@ impl Inner {
             .filter_map(|s| self.unrouted(net, cfg, s).map(|why| json!({"id": s.id, "reason": why})))
             .collect();
         // Your node alone dials only its own Tor, if any.
-        let proxy = if sources::own_node_on(&cfg.sources) { self.tor_proxy().filter(|_| self.own_node_tor(cfg)) } else { self.dial_proxy() };
+        let proxy = if sources::own_node_on(&cfg.sources) { self.tor_proxy().filter(|_| self.own_node_tor(cfg)) } else { self.dial_proxy(cfg) };
         reply::ok(json!({
             "network": net.name(),
             "proxy": proxy,
@@ -406,7 +407,7 @@ impl Inner {
             "check": r.check,
             "peers": peers,
             "unrouted": unrouted,
-            "torUse": self.store.tor_use,
+            "torUse": cfg.tor_use,
             "kyotoSplit": split,
         }))
     }
@@ -416,7 +417,7 @@ impl Inner {
         let wallet_open = self.wallet_open.contains(&net);
         let Some(cfg) = self.cfg(net) else {
             return json!({"network": net.name(), "configured": false, "walletOpen": wallet_open, "proxy": self.store.proxy(),
-                          "torUse": self.store.tor_use, "torUseChosen": self.store.tor_use_chosen,
+                          "torUse": TorUse::Identifying, "torUseChosen": false,
                           "sources": [], "exposes": [], "withoutTor": []});
         };
         let route = |s: &Source| self.route_of(cfg, s);
@@ -435,8 +436,8 @@ impl Inner {
             "configured": true,
             "walletOpen": wallet_open,
             "proxy": self.store.proxy(),
-            "torUse": self.store.tor_use,
-            "torUseChosen": self.store.tor_use_chosen,
+            "torUse": cfg.tor_use,
+            "torUseChosen": cfg.tor_use_chosen,
             "sources": list,
             "exposes": sources::exposes(&cfg.sources, lan),
             "withoutTor": sources::without_tor(&cfg.sources, route, lan),
@@ -460,7 +461,7 @@ impl Inner {
     fn health_value(&self, net: BNetwork) -> Value {
         let Some(cfg) = self.cfg(net) else {
             return json!({"network": net.name(), "configured": false, "overall": health::Overall::Offline, "pending": false, "sources": [],
-                          "torUse": self.store.tor_use, "torUseChosen": self.store.tor_use_chosen});
+                          "torUse": TorUse::Identifying, "torUseChosen": false});
         };
         let measured: Vec<(&Source, Option<Health>, usize)> = cfg
             .sources
@@ -513,8 +514,8 @@ impl Inner {
             "pending": measured.iter().any(|(s, h, _)| sources::in_use(&cfg.sources, s) && h.is_none()),
             "sources": list,
             "tor": self.tor_value(cfg),
-            "torUse": self.store.tor_use,
-            "torUseChosen": self.store.tor_use_chosen,
+            "torUse": cfg.tor_use,
+            "torUseChosen": cfg.tor_use_chosen,
         })
     }
 
@@ -539,7 +540,7 @@ impl Inner {
             "counts": self.counts(net, cfg),
             "route": self.route_of(cfg, &kyoto),
             "kyotoTor": tor,
-            "torUse": self.store.tor_use,
+            "torUse": cfg.tor_use,
             "clearnet": clearnet,
         })
     }
@@ -677,10 +678,10 @@ impl Node {
     pub fn harvest_plan(&self) -> Vec<Harvest> {
         let mut inner = self.lock();
         let now = now();
-        let proxy = inner.dial_proxy().map(String::from);
         let mut out = Vec::new();
         for net in networks() {
             let Some(cfg) = inner.cfg(net) else { continue };
+            let proxy = inner.dial_proxy(cfg).map(String::from);
             let Some(kyoto) = cfg.sources.iter().find(|s| s.kind == Kind::Kyoto && sources::in_use(&cfg.sources, s)) else { continue };
             if !cfg.own_peers.is_empty() || !inner.wallet_open.contains(&net) {
                 continue;
@@ -688,7 +689,7 @@ impl Node {
             let tor = cfg.kyoto_tor();
             let onion = inner.kyoto_onion(net, cfg);
             // Not while Kyoto has no route: in `identifying` without a proxy it does not run.
-            let clear = (!onion || (inner.store.tor_use == TorUse::Identifying && tor)) && inner.blocked(cfg, kyoto).is_none();
+            let clear = (!onion || (cfg.tor_use == TorUse::Identifying && tor)) && inner.blocked(cfg, kyoto).is_none();
             if clear && inner.clear_books.get(&net).is_some_and(|b| b.harvest_due(false, now)) {
                 let b = inner.clear_books.get_mut(&net).expect("checked");
                 let seeds = b.pick_seeds().into_iter().map(|p| (p, Route::Direct)).collect();
@@ -742,11 +743,12 @@ impl Node {
         learning
     }
 
-    /// Whether the proxy is the built-in Tor and Tor is used, or your node at an address is
-    /// reached through it: only then is tor_module asked, and asking is what starts it.
+    /// Whether the proxy is the built-in Tor and a network in play uses Tor, or your node at an
+    /// address is reached through it: only then is tor_module asked, and asking is what starts it.
     pub fn uses_built_in_tor(&self) -> bool {
         let inner = self.lock();
-        inner.store.proxy() == Some(BUILT_IN) && (inner.tor_on() || inner.store.networks.values().any(|c| inner.own_node_tor(c)))
+        inner.store.proxy() == Some(BUILT_IN)
+            && inner.store.networks.iter().any(|(n, c)| inner.in_play(*n, c) && (c.tor_use.tor() || inner.own_node_tor(c)))
     }
 
     /// tor_module's latest status. Routes follow its SOCKS port and health shows it. The poller
@@ -848,9 +850,12 @@ impl Node {
             (_, true) if proxy_set => "configured",
             _ => "unready",
         };
+        let per = |f: fn(&NetConfig) -> Value| -> serde_json::Map<String, Value> {
+            inner.store.networks.iter().map(|(n, c)| (n.name().to_string(), f(c))).collect()
+        };
         reply::ok(json!({"state": state, "configured": names(configured), "unconfigured": names(unconfigured),
                          "proxySet": proxy_set, "walletOpen": names(inner.wallet_open.iter().copied()),
-                         "torUse": inner.store.tor_use, "torUseChosen": inner.store.tor_use_chosen}))
+                         "torUse": per(|c| json!(c.tor_use)), "torUseChosen": per(|c| json!(c.tor_use_chosen))}))
     }
 
     /// Fills what is absent, field by field: the proxy, and each network's sources (Kyoto on, one
@@ -951,9 +956,13 @@ impl Node {
         )
     }
 
-    /// What Tor carries, for every network, and that the person chose it. Refused while any
-    /// wallet is open.
-    pub fn set_tor_use(&self, mode: &str) -> String {
+    /// What Tor carries on `network`, and that the person chose it. Refused while any wallet
+    /// is open.
+    pub fn set_tor_use(&self, network: &str, mode: &str) -> String {
+        let net = match parse_net(network) {
+            Ok(n) => n,
+            Err(e) => return reply::err(e),
+        };
         let Some(m) = TorUse::parse(mode) else { return reply::err(format!("{}torUse must be all, identifying or none", reply::INVALID)) };
         self.mutate(
             true,
@@ -961,10 +970,14 @@ impl Node {
                 if !open.is_empty() {
                     return Err(LOCKED.into());
                 }
-                (store.tor_use, store.tor_use_chosen) = (m, true);
+                let cfg = store.networks.get_mut(&net).ok_or_else(|| not_configured(net))?;
+                (cfg.tor_use, cfg.tor_use_chosen) = (m, true);
                 Ok(((), vec![]))
             },
-            |inner, ()| reply::ok(json!({"torUse": inner.store.tor_use, "torUseChosen": inner.store.tor_use_chosen})),
+            |inner, ()| {
+                let cfg = inner.cfg(net).expect("set above");
+                reply::ok(json!({"network": net.name(), "torUse": cfg.tor_use, "torUseChosen": cfg.tor_use_chosen}))
+            },
         )
     }
 
@@ -1178,7 +1191,7 @@ impl Node {
     pub fn poll_plan(&self) -> (Vec<Target>, Vec<(Target, &'static str)>) {
         let inner = self.lock();
         let (mut targets, mut skipped) = (Vec::new(), Vec::new());
-        for (net, cfg) in &inner.store.networks {
+        for (net, cfg) in inner.store.networks.iter().filter(|(n, c)| inner.in_play(**n, c)) {
             for s in cfg.sources.iter().filter(|s| sources::in_use(&cfg.sources, s) && s.kind.is_server()) {
                 let t = inner.target(*net, cfg, s);
                 match inner.blocked(cfg, s) {

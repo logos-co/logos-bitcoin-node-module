@@ -32,10 +32,12 @@ fn harness() -> Harness {
     Harness { node, events, dir }
 }
 
-/// Configured with the defaults, the built-in Tor ready at `TOR`, and the events so far dropped.
+/// Configured with the defaults, `identifying` chosen on every network, the built-in Tor ready at
+/// `TOR`, and the events so far dropped.
 fn configured() -> Harness {
     let h = harness();
     assert_eq!(v(h.node.init_defaults())["ok"], true);
+    h.tor_use("identifying");
     h.node.set_tor(tor_view("ready", Some(TOR)));
     h.take();
     h
@@ -47,6 +49,13 @@ fn tor_view(state: &str, socks: Option<&str>) -> TorView {
 }
 
 impl Harness {
+    /// The same Use Tor for on every network.
+    fn tor_use(&self, mode: &str) {
+        for net in networks() {
+            assert_eq!(v(self.node.set_tor_use(net.name(), mode))["ok"], true, "{}", net.name());
+        }
+    }
+
     fn take(&self) -> Vec<String> {
         std::mem::take(&mut *self.events.lock().unwrap())
     }
@@ -461,7 +470,7 @@ fn the_wallet_core_reports_on_kyotos_peers() {
 #[test]
 fn the_fixed_seeds_are_asked_only_when_the_book_runs_short() {
     let h = configured();
-    h.node.set_tor_use("all");
+    h.tor_use("all");
     assert!(h.node.harvest_plan().is_empty(), "no wallet open");
     h.node.set_wallet_open("signet", true);
     let plan = h.node.harvest_plan();
@@ -495,7 +504,7 @@ fn the_fixed_seeds_are_asked_only_when_the_book_runs_short() {
     for (name, n) in [("own peers", &own), ("no proxy", &off), ("12 worked", &fine)] {
         n.node.set_wallet_open("signet", false);
         n.node.set_wallet_open("mainnet", false);
-        n.node.set_tor_use("all");
+        n.tor_use("all");
         n.node.set_wallet_open(if name == "12 worked" { "mainnet" } else { "signet" }, true);
         assert!(n.node.harvest_plan().is_empty(), "{name}");
     }
@@ -695,6 +704,7 @@ fn probes_go_through_the_health_thread() {
 fn the_built_in_tor_is_the_default_and_routes_follow_its_socks_port() {
     let h = harness();
     h.node.init_defaults();
+    h.tor_use("identifying");
     assert!(h.node.uses_built_in_tor());
     assert_eq!(v(h.node.get_sources("mainnet"))["proxy"], "tor");
     // Not heard from yet: Tor routes wait, and health says Tor is starting.
@@ -756,27 +766,52 @@ fn clear_gossip(hosts: &[&str]) -> Vec<Gossip> {
 }
 
 #[test]
-fn tor_use_is_chosen_once_and_locked_while_a_wallet_is_open() {
-    let h = configured();
+fn tor_use_is_chosen_per_network_and_locked_while_a_wallet_is_open() {
+    let h = harness();
+    assert_eq!(v(h.node.init_defaults())["ok"], true);
     let status = |h: &Harness| v(h.node.config_status());
-    assert_eq!((&status(&h)["torUse"], &status(&h)["torUseChosen"]), (&json!("identifying"), &json!(false)), "a fresh install");
-    assert_eq!(v(h.node.set_tor_use("everything"))["error"], "invalid parameters: torUse must be all, identifying or none");
+    assert_eq!((&status(&h)["torUse"]["signet"], &status(&h)["torUseChosen"]["signet"]), (&json!("identifying"), &json!(false)), "a fresh install");
+    assert_eq!(v(h.node.set_tor_use("signet", "everything"))["error"], "invalid parameters: torUse must be all, identifying or none");
+    assert_eq!(v(h.node.set_tor_use("testnet3", "none"))["error"], "network must be mainnet, testnet4 or signet");
     h.node.set_wallet_open("testnet4", true);
-    assert_eq!(v(h.node.set_tor_use("none"))["error"], LOCKED, "any open wallet locks it");
+    assert_eq!(v(h.node.set_tor_use("signet", "none"))["error"], LOCKED, "any open wallet locks it");
     h.node.set_wallet_open("testnet4", false);
-    assert_eq!(v(h.node.set_tor_use("none")), json!({"ok": true, "torUse": "none", "torUseChosen": true}));
-    for (name, r) in [("sources", v(h.node.get_sources("signet"))), ("health", v(h.node.source_health("signet"))), ("status", status(&h))] {
+    assert_eq!(v(h.node.set_tor_use("signet", "none")), json!({"ok": true, "network": "signet", "torUse": "none", "torUseChosen": true}));
+    for (name, r) in [("sources", v(h.node.get_sources("signet"))), ("health", v(h.node.source_health("signet")))] {
         assert_eq!((&r["torUse"], &r["torUseChosen"]), (&json!("none"), &json!(true)), "{name}");
     }
+    assert_eq!(v(h.node.route_table("signet"))["torUse"], "none");
+    // Another network keeps its own, still to be chosen.
+    for r in [v(h.node.get_sources("mainnet")), v(h.node.source_health("mainnet"))] {
+        assert_eq!((&r["torUse"], &r["torUseChosen"]), (&json!("identifying"), &json!(false)));
+    }
+    assert_eq!(v(h.node.route_table("mainnet"))["torUse"], "identifying");
     let again = Node::open(Some(h.dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
-    assert_eq!(v(again.config_status())["torUse"], "none", "kept");
+    let st = v(again.config_status());
+    assert_eq!((&st["torUse"]["signet"], &st["torUseChosen"]["signet"], &st["torUseChosen"]["mainnet"]), (&json!("none"), &json!(true), &json!(false)), "kept");
+}
+
+/// Nothing is probed, and Tor is not started, for a network before its choice or an open wallet.
+#[test]
+fn a_network_not_yet_set_up_is_left_alone() {
+    let h = harness();
+    assert_eq!(v(h.node.init_defaults())["ok"], true);
+    assert!(!h.node.uses_built_in_tor(), "no network chosen yet");
+    assert!(h.node.poll_plan().0.is_empty() && h.node.poll_plan().1.is_empty());
+    h.node.set_tor_use("mainnet", "none");
+    assert!(!h.node.uses_built_in_tor(), "mainnet goes without Tor");
+    let (targets, skipped) = h.node.poll_plan();
+    assert!(!skipped.is_empty() && targets.iter().chain(skipped.iter().map(|(t, _)| t)).all(|t| t.network == BNetwork::Mainnet && t.proxy.is_none()));
+    h.node.set_wallet_open("testnet4", true);
+    assert!(h.node.uses_built_in_tor(), "testnet4's wallet uses identifying");
+    assert!(h.node.poll_plan().0.iter().chain(h.node.poll_plan().1.iter().map(|(t, _)| t)).any(|t| t.network == BNetwork::Testnet4));
 }
 
 #[test]
 fn none_turns_tor_off_and_kyoto_dials_the_clearnet_book() {
     let h = configured();
     assert!(h.node.uses_built_in_tor());
-    h.node.set_tor_use("none");
+    h.tor_use("none");
     assert!(!h.node.uses_built_in_tor(), "tor_module is never asked");
     let t = v(h.node.route_table("signet"));
     assert_eq!((&t["proxy"], &t["torUse"], &t["kyotoSplit"]), (&Value::Null, &json!("none"), &Value::Null));
@@ -807,9 +842,9 @@ fn none_turns_tor_off_and_kyoto_dials_the_clearnet_book() {
     assert_eq!(route_of(&v(h.node.route_table("signet")), "chain", KYOTO_ID), "direct");
     // An onion peer of your own has no route.
     h.node.set_wallet_open("signet", false);
-    h.node.set_tor_use("all");
+    h.tor_use("all");
     h.node.set_own_peers("signet", &json!([format!("{}:38333", onion())]).to_string());
-    h.node.set_tor_use("none");
+    h.tor_use("none");
     assert!(v(h.node.route_table("signet"))["unrouted"].as_array().unwrap().iter().any(|u| u["id"] == KYOTO_ID && u["reason"] == TOR_OFF));
 }
 
@@ -853,9 +888,9 @@ fn identifying_splits_kyoto_once_both_books_have_peers() {
     assert!(peer_strings(&t["peers"]).contains(&"9.9.9.9:38333".to_string()));
     // All, or peers of your own: no split.
     h.node.set_source("signet", KYOTO_ID, r#"{"tor":true}"#);
-    h.node.set_tor_use("all");
+    h.tor_use("all");
     assert_eq!(v(h.node.route_table("signet"))["kyotoSplit"], Value::Null);
-    h.node.set_tor_use("identifying");
+    h.tor_use("identifying");
     assert!(v(h.node.route_table("signet"))["kyotoSplit"].is_object());
     h.node.set_own_peers("signet", r#"["192.168.1.20"]"#);
     assert_eq!(v(h.node.route_table("signet"))["kyotoSplit"], Value::Null);
@@ -918,7 +953,7 @@ fn your_node_alone_makes_no_other_request() {
 #[test]
 fn your_node_at_an_address_follows_its_own_tor_switch() {
     let h = configured();
-    h.node.set_tor_use("none");
+    h.tor_use("none");
     assert!(!h.node.uses_built_in_tor());
     let o = onion();
     let list = json!([{"id": "kyoto", "kind": "kyoto"}, {"id": "mine", "kind": "rpc", "url": "https://node.example", "tor": true},
