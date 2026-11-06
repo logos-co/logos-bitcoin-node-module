@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::addr;
-use crate::net::client::{is_onion, Route};
+use crate::net::client::{is_onion, route_for, Route};
 use crate::network::BNetwork;
 use crate::reply::INVALID;
 
@@ -501,16 +501,7 @@ pub fn in_use(list: &[Source], s: &Source) -> bool {
 /// The chain follows what is switched on, so an unreachable Kyoto never hands it to a server.
 pub fn roles(list: &[Source], route: impl Fn(&Source) -> Route, usable: impl Fn(&Source) -> bool) -> Roles {
     let on = |s: &Source| in_use(list, s) && usable(s);
-    let entry = |s: &Source| RouteEntry {
-        id: s.id.clone(),
-        kind: s.kind,
-        url: s.url.clone(),
-        operator: s.operator.clone(),
-        route: route(s),
-        credentials: s.credentials.is_some(),
-        cert_sha256: s.cert_sha256.clone(),
-        user_added: user_added(s),
-    };
+    let entry = |s: &Source| route_entry(s, route(s));
     let pick = |keep: &dyn Fn(&Source) -> bool| -> Vec<RouteEntry> { list.iter().filter(|s| on(s) && keep(s)).map(&entry).collect() };
     let authority = list.iter().any(|s| s.enabled && matches!(s.kind, Kind::Local | Kind::Rpc | Kind::Kyoto));
     let (node, kyoto) = (pick(&|s| matches!(s.kind, Kind::Local | Kind::Rpc)), pick(&|s| s.kind == Kind::Kyoto));
@@ -527,6 +518,31 @@ pub fn roles(list: &[Source], route: impl Fn(&Source) -> Route, usable: impl Fn(
         chain,
         broadcast,
     }
+}
+
+pub fn route_entry(s: &Source, route: Route) -> RouteEntry {
+    RouteEntry {
+        id: s.id.clone(),
+        kind: s.kind,
+        url: s.url.clone(),
+        operator: s.operator.clone(),
+        route,
+        credentials: s.credentials.is_some(),
+        cert_sha256: s.cert_sha256.clone(),
+        user_added: user_added(s),
+    }
+}
+
+/// Where payments go with your node on and public servers picked: the Electrum servers switched
+/// on, else the network's shipped onion server; over Tor whatever Use Tor for says, one on your
+/// own network directly. Empty when there is none, and then your node sends them.
+pub fn public_senders(net: BNetwork, list: &[Source], usable: impl Fn(&Source) -> bool) -> Vec<RouteEntry> {
+    let entry = |s: &Source| route_entry(s, route_for(&host(s), true));
+    let on: Vec<RouteEntry> = list.iter().filter(|s| s.enabled && s.kind == Kind::Electrum && usable(s)).map(entry).collect();
+    if !on.is_empty() {
+        return on;
+    }
+    defaults(net).iter().filter(|s| s.enabled && s.kind == Kind::Electrum && is_onion(&host(s)) && usable(s)).map(entry).collect()
 }
 
 /// A source in exposes or withoutTor.

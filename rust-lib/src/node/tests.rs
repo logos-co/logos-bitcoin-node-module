@@ -917,7 +917,9 @@ fn your_node_alone_makes_no_other_request() {
     let s = v(h.node.set_sources("signet", &list.to_string()));
     assert_eq!((&s["exposes"], &s["withoutTor"]), (&json!([]), &json!([])), "{s}");
     h.node.set_proxy(&proxy);
+    assert_eq!(v(h.node.set_local_sends("signet", "node"))["localSends"], "node", "payments through your node too");
     let rt = v(h.node.route_table("signet"));
+    assert_eq!(rt["localSends"], "node");
     for role in ["chain", "history", "pending", "fees", "broadcast"] {
         assert_eq!(ids(&rt, role), ["local"], "{role}");
     }
@@ -946,6 +948,84 @@ fn your_node_alone_makes_no_other_request() {
     });
     assert_eq!(ids(&v(h.node.route_table("signet")), "chain"), ["kyoto"]);
     assert!(poller.stop(Duration::from_millis(1000)), "joined");
+}
+
+/// With your node on, payments go through public servers over Tor until bitcoind sends privately
+/// or the person picks; the switched-on Electrum servers, else the shipped onion one, else the node.
+#[test]
+fn payments_with_your_node_follow_the_pick_else_the_node() {
+    let h = configured();
+    let o = onion();
+    let list = json!([
+        {"id": "kyoto", "kind": "kyoto"},
+        {"id": "home", "kind": "electrum", "url": "tcp://192.168.1.5:50001", "history": true},
+        {"id": "hidden", "kind": "electrum", "url": format!("{o}:110")},
+        {"id": "far", "kind": "electrum", "url": "ssl://electrum.example:50002", "use": false},
+        {"id": "local", "kind": "local"},
+    ]);
+    v(h.node.set_sources("signet", &list.to_string()));
+    let sends = |h: &Harness| v(h.node.get_sources("signet"))["sends"].clone();
+    let s = sends(&h);
+    assert_eq!((&s["localSends"], &s["localSendsChosen"], &s["localSendsRecommended"]), (&json!("servers"), &json!(false), &json!("servers")), "{s}");
+    let rt = v(h.node.route_table("signet"));
+    assert_eq!((ids(&rt, "broadcast"), &rt["localSends"], &rt["proxy"]), (vec!["home".to_string(), "hidden".into(), "local".into()], &json!("servers"), &json!(TOR)), "your node last, for an older core");
+    assert_eq!((route_of(&rt, "broadcast", "home"), route_of(&rt, "broadcast", "hidden")), ("direct".into(), "onion".into()), "your own network directly");
+    assert_eq!(ids(&rt, "history"), ["local"], "reads stay with your node");
+    assert!(h.node.uses_built_in_tor(), "sends over Tor ask the built-in Tor");
+    // bitcoind sends privately: through your node, with no proxy.
+    h.node.set_local_private(BNetwork::Signet, Some(true));
+    assert!(h.take().contains(&"routes signet".to_string()));
+    let rt = v(h.node.route_table("signet"));
+    assert_eq!((ids(&rt, "broadcast"), &rt["localSends"], &rt["proxy"]), (vec!["local".to_string()], &json!("node"), &Value::Null));
+    assert_eq!(sends(&h)["localSendsRecommended"], "node");
+    // The person's pick wins, and is kept.
+    assert_eq!(v(h.node.set_local_sends("signet", "servers"))["localSendsChosen"], true);
+    assert_eq!(ids(&v(h.node.route_table("signet")), "broadcast"), ["home", "hidden", "local"]);
+    assert!(v(h.node.set_local_sends("signet", "peers"))["error"].as_str().unwrap().contains("servers or node"));
+    h.node.set_wallet_open("signet", true);
+    assert_eq!(v(h.node.set_local_sends("signet", "node"))["error"], LOCKED);
+    h.node.set_wallet_open("signet", false);
+    let back = Node::open(Some(h.dir.path().join(crate::store::FILE_NAME)), Arc::new(|_| {}));
+    assert_eq!(v(back.get_sources("signet"))["sends"]["localSends"], "servers", "stored");
+    // No Electrum server on and none shipped on signet: your node sends them.
+    let none = json!([{"id": "kyoto", "kind": "kyoto"}, {"id": "hidden", "kind": "electrum", "url": format!("{o}:110"), "use": false}, {"id": "local", "kind": "local"}]);
+    v(h.node.set_sources("signet", &none.to_string()));
+    let rt = v(h.node.route_table("signet"));
+    assert_eq!((ids(&rt, "broadcast"), &rt["localSends"]), (vec!["local".to_string()], &json!("node")));
+    assert_eq!(sends(&h)["sendServers"], json!([]));
+    // Mainnet ships an onion server: it carries them when none is on.
+    let main = json!([{"id": "kyoto", "kind": "kyoto"}, {"id": "electrum.blockstream.info", "kind": "electrum", "url": "ssl://electrum.blockstream.info:50002", "use": false},
+                      {"id": "local", "kind": "local"}]);
+    v(h.node.set_sources("mainnet", &main.to_string()));
+    let rt = v(h.node.route_table("mainnet"));
+    assert_eq!((ids(&rt, "broadcast"), route_of(&rt, "broadcast", "electrum.blockstream.info-onion")), (vec!["electrum.blockstream.info-onion".to_string(), "local".into()], "onion".into()));
+    // Your node at an address can't be asked: public servers stay recommended.
+    let rpc = json!([{"id": "kyoto", "kind": "kyoto"}, {"id": "hidden", "kind": "electrum", "url": format!("{o}:110")}, {"id": "mine", "kind": "rpc", "url": "http://192.168.1.9:8332"}]);
+    v(h.node.set_sources("testnet4", &rpc.to_string()));
+    h.node.set_local_private(BNetwork::Testnet4, Some(true));
+    let s = v(h.node.get_sources("testnet4"))["sends"].clone();
+    assert_eq!((&s["localSends"], &s["localSendsRecommended"]), (&json!("servers"), &json!("servers")));
+    assert_eq!(ids(&v(h.node.route_table("testnet4")), "broadcast"), ["hidden", "mine"]);
+    // Without your node, nothing changes.
+    assert_eq!(v(h.node.get_sources("testnet4"))["sends"]["localSends"], "servers");
+    v(h.node.set_source("testnet4", "mine", r#"{"use":false}"#));
+    let s = v(h.node.get_sources("testnet4"))["sends"].clone();
+    assert_eq!((&s["localSends"], &v(h.node.route_table("testnet4"))["localSends"]), (&Value::Null, &Value::Null));
+}
+
+#[test]
+fn bitcoind_sends_privately_by_its_status_else_its_settings() {
+    let n = BNetwork::Signet;
+    let running = |mode: &str| json!({"state": "running", "network": "signet", "privateSends": mode});
+    assert_eq!(sends_privately(n, None, Some(&running("on"))), Some(true));
+    assert_eq!(sends_privately(n, None, Some(&running("proxy"))), Some(true));
+    assert_eq!(sends_privately(n, Some(&json!({"privateSends": true})), Some(&running("unavailable"))), Some(false), "what runs wins");
+    let other = json!({"state": "running", "network": "main", "privateSends": "off"});
+    assert_eq!(sends_privately(n, Some(&json!({"privateSends": true, "proxy": ""})), Some(&other)), Some(true), "another network runs");
+    assert_eq!(sends_privately(BNetwork::Mainnet, None, Some(&json!({"state": "running", "network": "main", "privateSends": "on"}))), Some(true));
+    assert_eq!(sends_privately(n, Some(&json!({"proxy": "127.0.0.1:9050"})), None), Some(true), "an older bitcoind with a proxy");
+    assert_eq!(sends_privately(n, Some(&json!({"proxy": ""})), None), Some(false), "an older bitcoind without one");
+    assert_eq!(sends_privately(n, None, None), None);
 }
 
 /// Use Tor for is for public sources: your node at an address takes its own Tor switch, and an
