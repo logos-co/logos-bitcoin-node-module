@@ -37,6 +37,24 @@ pub enum TorUse {
     None,
 }
 
+/// With your own node on, where payments go out: public servers over Tor, or the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalSends {
+    Servers,
+    Node,
+}
+
+impl LocalSends {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "servers" => Some(Self::Servers),
+            "node" => Some(Self::Node),
+            _ => None,
+        }
+    }
+}
+
 impl TorUse {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
@@ -78,12 +96,15 @@ pub struct NetConfig {
     /// Set once the person picked `tor_use` for this network; until then the app asks first.
     #[serde(default)]
     pub tor_use_chosen: bool,
+    /// The person's pick; absent, it follows the node (`Inner::sends`). Written only once picked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_sends: Option<LocalSends>,
 }
 
 impl NetConfig {
     /// A new network starts at `identifying`, not yet chosen.
     pub fn seeded(net: BNetwork) -> Self {
-        Self { sources: sources::defaults(net), suspects: BTreeMap::new(), own_peers: vec![], tor_use: TorUse::Identifying, tor_use_chosen: false }
+        Self { sources: sources::defaults(net), suspects: BTreeMap::new(), own_peers: vec![], tor_use: TorUse::Identifying, tor_use_chosen: false, local_sends: None }
     }
 
     pub fn source(&self, id: &str) -> Option<&Source> {

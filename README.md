@@ -26,7 +26,8 @@ the route are computed. Kinds:
 - While your node is on, the wallet asks it alone: Kyoto and every server leave every role,
   `exposes`, `withoutTor`, the health poll and the peer harvest, and `probe` refuses them with
   `your node is in use: the wallet asks it alone`. Their switches stay as set, so turning your
-  node off brings them back as they were.
+  node off brings them back as they were. Payments may still go out through public servers
+  (Sending payments, below).
 - `esplora` is refused: `invalid parameters: <id>: Esplora servers are no longer supported; use
   an Electrum server`. A store from before version 4 moves its Esplora entries (Store, below).
 - `history` means the source is asked about the wallet's addresses. Electrum only; your node
@@ -89,7 +90,7 @@ pin one with `certSha256` to use it.
 ## Store
 
 `bitcoin_sources.json` is at version 5: Use Tor for per network, no Esplora, no PublicNode, and
-at most one node source on. A version 4 store gives its one `torUse` to every network, not chosen,
+at most one node source on. A network's `localSends` is written only once picked. A version 4 store gives its one `torUse` to every network, not chosen,
 so the app asks again per network with it preselected. A version 3 or older store also moves over
 on load, per network:
 
@@ -150,11 +151,31 @@ its SOCKS port is off (the Tor app turns it on), or it is not available. `source
 `tor`: `{ state, progress, detail, socks, answered }` for the built-in Tor, null for your own.
 `socks` is null while its SOCKS port is off, and `answered` false until tor_module answers.
 
+### Sending payments
+
+With your node on, `set_local_sends(network, via)` says where that network's payments go:
+`servers` (public Electrum servers over Tor) or `node`. Backend only, refused while any wallet
+is open, and stored as `localSends` once picked. Until then the node decides:
+
+- the node in Logos, when bitcoind sends privately: its status says `privateSends` `on` or
+  `proxy` while it runs that network; otherwise its settings have `privateSends` true or a
+  `proxy`. bitcoind is asked every 15 s for each network whose own node is the one in Logos,
+  its Node settings saved or not;
+- otherwise public servers, and always for your node at an address, which can't be asked.
+
+The servers are the Electrum servers switched on, else the network's shipped onion server
+(mainnet and testnet4; signet ships none). They go through Tor whatever Use Tor for says; one on
+your own network is reached directly. With none, your node sends them. Their suspects and wrong
+networks are left out. `get_sources` and `source_health` carry `sends: { localSends,
+localSendsChosen, localSendsRecommended, sendServers: [{ id, operator, route }] }`, `localSends`
+null while your node is off.
+
 ## Routes
 
 `route_table(network)` gives one list per role, each `{ id, kind, url, operator, route }` with
 `route` `tor`, `direct` or `onion`, in failover order. While your node is on, every role but
-`check` is your node alone and `check` is empty; otherwise:
+`check` is your node alone and `check` is empty, except `broadcast` when payments go through
+public servers (Sending payments, above); otherwise:
 
 - `chain`: Kyoto; only when it is off, every Electrum server (the most-work chain wins). It
   follows what is switched on, so an unreachable Kyoto never hands the chain to a server.
@@ -169,7 +190,12 @@ RPC credentials are stored owner-only, and only the wallet core reads them, with
 
 Plus `proxy` (the SOCKS URL to dial; for `tor`, tor_module's port), `peers` (Kyoto's peers,
 below), `unrouted` (enabled sources left out, and why: your node is in use, no Tor route,
-suspect, wrong network), `torUse`, and `kyotoSplit`. There is no `crossCheck` any more: an older core only printed it.
+suspect, wrong network), `torUse`, `kyotoSplit`, and `localSends`: with your node on, `servers`
+when `broadcast` starts with public servers and `node` when it holds only your node; null
+otherwise. With `servers`, your node is still listed last: an older core ignores `localSends`
+and sends only through your node, as before; a newer one leaves your node out. `proxy` is set
+when your node or those servers go through Tor. There is no `crossCheck` any more: an
+older core only printed it.
 
 `kyotoSplit` is set only in `identifying`, with Kyoto on the books (no own peers) and its Tor
 switch on, once both books have usable peers: `{ chain: { route: "direct", peers }, tor: {
@@ -272,6 +298,9 @@ cd rust-lib && cargo test --no-default-features
 BITCOIN_TEST_TOR=socks5h://127.0.0.1:9050 cargo test --no-default-features --test live -- --ignored --nocapture
 # The harvest against a regtest bitcoind it starts itself (31.x), its address book filled first
 BITCOIND=/path/to/bitcoind cargo test --no-default-features --test regtest -- --ignored harvest_against --nocapture
+# Through the real modules (logosctl, bitcoind_module, tor_module): the default way payments go
+# follows bitcoind, on a network whose Node settings were never saved
+doctests/run.sh --release-for logos-bitcoin-node-module=<pushed commit>
 ```
 
 ## Windows

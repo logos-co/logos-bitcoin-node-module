@@ -45,6 +45,11 @@ pub trait BitcoinNodeModule: Send + Sync + 'static {
     /// network's `torUseChosen`. `{ ok, network, torUse, torUseChosen }`. Backend only; refused
     /// while any wallet is open.
     fn set_tor_use(&self, network: String, mode: String) -> String;
+    /// With your own node on, where `network`'s payments go: `servers` (public Electrum servers
+    /// over Tor) or `node`; until set, the node in Logos when bitcoind sends privately, else
+    /// servers. `{ ok, network, localSends, localSendsChosen, localSendsRecommended,
+    /// sendServers }`. Backend only; refused while any wallet is open.
+    fn set_local_sends(&self, network: String, via: String) -> String;
     /// Whether a wallet is open on `network`, which locks its settings. Backend only.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
     /// `{ ok, network, proxy, chain, history, pending, fees, broadcast, check, peers, unrouted,
@@ -164,6 +169,10 @@ impl BitcoinNodeModule for BitcoinNodeModuleImpl {
         self.gated(Access::Backend, |n| n.set_tor_use(&network, &mode))
     }
 
+    fn set_local_sends(&self, network: String, via: String) -> String {
+        self.gated(Access::Backend, |n| n.set_local_sends(&network, &via))
+    }
+
     fn set_wallet_open(&self, network: String, open: bool) -> String {
         self.gated(Access::Backend, |n| n.set_wallet_open(&network, open))
     }
@@ -271,8 +280,32 @@ impl crate::node::LocalStatus for BitcoindStatus {
 /// One status() call to tor_module, which answers at once.
 const TOR_BUDGET: Duration = Duration::from_millis(1000);
 
+/// How often bitcoind is asked whether it sends privately, for networks using the node in Logos.
+const LOCAL_EVERY: Duration = Duration::from_secs(15);
+
+/// One async call, waited for here: a blocking call nests in the main thread's event loop.
+fn waited<T: Send + 'static, E: ToString + 'static>(budget: Duration, call: impl FnOnce(Box<dyn FnOnce(Result<T, E>) + Send>)) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    call(Box::new(move |r| {
+        let _ = tx.send(r.map_err(|e| e.to_string()));
+    }));
+    rx.recv_timeout(budget + Duration::from_millis(200)).unwrap_or_else(|_| Err("no answer".into()))
+}
+
+fn obj(m: impl IntoIterator<Item = (String, serde_json::Value)>) -> serde_json::Value {
+    serde_json::Value::Object(m.into_iter().collect())
+}
+
+/// Whether bitcoind sends `net`'s payments privately, from its settings and status.
+fn local_private(client: &bitcoind_module::BitcoindModuleClient, net: crate::network::BNetwork) -> Option<bool> {
+    let config = waited(LOCAL_BUDGET, |cb| client.get_config_async_with_timeout(net.name(), LOCAL_BUDGET, move |r| cb(r.map(obj)))).ok();
+    let status = waited(LOCAL_BUDGET, |cb| client.status_async_with_timeout(LOCAL_BUDGET, move |r| cb(r.map(obj)))).ok();
+    crate::node::sends_privately(net, config.as_ref(), status.as_ref())
+}
+
 /// Follows the built-in Tor while the proxy is it: every 2 s until it is ready, then every
-/// 30 s. Asking is what starts it, so with the user's own Tor or none it is never asked.
+/// 30 s. Asking is what starts it, so with the user's own Tor or none it is never asked. Also
+/// asks bitcoind every 15 s whether it sends privately, while a network uses the node in Logos.
 struct TorFollower {
     stop: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -283,9 +316,19 @@ impl TorFollower {
         let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let flag = stop.clone();
         let thread = std::thread::Builder::new().name("bitcoin-node-tor".into()).spawn(move || {
-            // One client: each new one opens its own connection.
+            // One client each: each new one opens its own connection.
             let client = tor_module::TorModuleClient::new();
+            let bitcoind = std::sync::OnceLock::<bitcoind_module::BitcoindModuleClient>::new();
+            let mut local_at: Option<std::time::Instant> = None;
             loop {
+                let watch = node.local_sends_watch();
+                if !watch.is_empty() && local_at.is_none_or(|t| t.elapsed() >= LOCAL_EVERY) {
+                    local_at = Some(std::time::Instant::now());
+                    let b = bitcoind.get_or_init(bitcoind_module::BitcoindModuleClient::new);
+                    for net in watch {
+                        node.set_local_private(net, local_private(b, net));
+                    }
+                }
                 let mut every = Duration::from_secs(2);
                 if node.uses_built_in_tor() {
                     // Async, then waited for here: a blocking call nests in the main thread's event loop.
