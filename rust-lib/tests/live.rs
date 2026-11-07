@@ -79,6 +79,9 @@ fn poller_reports_and_stops() {
     });
     let node = Node::open(Some(dir.path().join("bitcoin_sources.json")), sink);
     assert!(node.init_defaults().starts_with(r#"{"ok":true"#));
+    for n in ["mainnet", "testnet4", "signet"] {
+        assert!(node.set_tor_use(n, "all").starts_with(r#"{"ok":true"#));
+    }
     assert!(node.set_proxy(&tor()).starts_with(r#"{"ok":true"#));
     let poller = Poller::start(node.clone()).unwrap();
     let health = |n: &str| serde_json::from_str::<Value>(&node.source_health(n)).unwrap();

@@ -88,8 +88,10 @@ pin one with `certSha256` to use it.
 
 ## Store
 
-`bitcoin_sources.json` is at version 4: no Esplora, no PublicNode, and at most one node source
-on. A version 3 or older store moves over on load, per network:
+`bitcoin_sources.json` is at version 5: Use Tor for per network, no Esplora, no PublicNode, and
+at most one node source on. A version 4 store gives its one `torUse` to every network, not chosen,
+so the app asks again per network with it preselected. A version 3 or older store also moves over
+on load, per network:
 
 | Before | After |
 |---|---|
@@ -102,8 +104,8 @@ on. A version 3 or older store moves over on load, per network:
 
 Pins and credentials never move to the Electrum entry: its certificate is another one. An
 Electrum entry that was already on keeps its own `tor`. The file keeps its old version until the
-next save, so an older build still reads it. Older builds set a version 4 store aside as
-unreadable, as they did versions 2 and 3.
+next save, so an older build still reads it. Older builds set a version 5 store aside as
+unreadable, as they did versions 2, 3 and 4.
 
 ## Tor
 
@@ -118,9 +120,11 @@ unreadable.
 
 ### Use Tor for
 
-`set_tor_use(mode)`, backend only and refused while any wallet is open, sets what Tor carries
-for every network, and `torUseChosen`: the app asks once, before the first account, while it is
-false. `config_status`, `get_sources` and `source_health` carry both.
+`set_tor_use(network, mode)`, backend only and refused while any wallet is open, sets what Tor
+carries on that network, and its `torUseChosen`: the app asks once per network, before an
+account there, while it is false. `get_sources` and `source_health` carry both for their network,
+`config_status` both by network name. Until a network's choice is made, or a wallet is open on
+it, its servers are not probed, and it does not count when deciding to ask tor_module.
 
 - `all`: every connection through Tor, as before.
 - `identifying` (a new install's default): servers as in `all`. Kyoto takes headers, filter
@@ -137,9 +141,9 @@ Use Tor for is for public sources. Your node at an address (`rpc`) goes through 
 proxy, tor_module is asked, and `source_health.tor` shows it. While your node is on, the table's
 `proxy` is set only for that, and `source_health.tor` only then.
 
-A version 3 store keeps `torUse` and `torUseChosen`. A fresh store starts at `identifying`, not
-chosen; a version 1 or 2 store loads as `all`, not chosen, so an upgrade never weakens its
-routing. Older builds set a version 3 store aside as unreadable, as they did version 2.
+Each network starts at `identifying`, not chosen. A version 3 or 4 store gives its one `torUse`
+to every network, and a version 1 or 2 store `all`, not chosen either, so an upgrade never weakens
+routing. Which Tor (`set_proxy`) stays one setting for every network.
 
 Without a route through Tor, `unrouted` says why: no proxy is set, the built-in Tor is starting,
 its SOCKS port is off (the Tor app turns it on), or it is not available. `source_health` carries

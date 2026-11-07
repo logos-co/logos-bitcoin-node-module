@@ -19,10 +19,12 @@ fn v(s: String) -> Value {
     serde_json::from_str(&s).unwrap()
 }
 
-/// Configured, with no proxy, so no test dials Tor: only regtest's loopback sources are reached.
+/// Configured, with regtest set up and no proxy, so no test dials Tor: only regtest's loopback
+/// sources are reached.
 fn open(dir: &tempfile::TempDir) -> Arc<Node> {
     let node = Node::open(Some(dir.path().join("bitcoin_sources.json")), Arc::new(|_| {}));
     assert_eq!(v(node.init_defaults())["ok"], true);
+    assert_eq!(v(node.set_tor_use("regtest", "identifying"))["ok"], true);
     assert_eq!(v(node.set_proxy(""))["proxy"], Value::Null);
     node
 }
