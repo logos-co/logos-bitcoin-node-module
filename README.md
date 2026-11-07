@@ -159,7 +159,8 @@ is open, and stored as `localSends` once picked. Until then the node decides:
 
 - the node in Logos, when bitcoind sends privately: its status says `privateSends` `on` or
   `proxy` while it runs that network; otherwise its settings have `privateSends` true or a
-  `proxy`. bitcoind is asked every 15 s while a network uses it;
+  `proxy`. bitcoind is asked every 15 s for each network whose own node is the one in Logos,
+  its Node settings saved or not;
 - otherwise public servers, and always for your node at an address, which can't be asked.
 
 The servers are the Electrum servers switched on, else the network's shipped onion server
@@ -297,6 +298,9 @@ cd rust-lib && cargo test --no-default-features
 BITCOIN_TEST_TOR=socks5h://127.0.0.1:9050 cargo test --no-default-features --test live -- --ignored --nocapture
 # The harvest against a regtest bitcoind it starts itself (31.x), its address book filled first
 BITCOIND=/path/to/bitcoind cargo test --no-default-features --test regtest -- --ignored harvest_against --nocapture
+# Through the real modules (logosctl, bitcoind_module, tor_module): the default way payments go
+# follows bitcoind, on a network whose Node settings were never saved
+doctests/run.sh --release-for logos-bitcoin-node-module=<pushed commit>
 ```
 
 ## Windows

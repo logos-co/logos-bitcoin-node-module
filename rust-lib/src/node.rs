@@ -1071,10 +1071,11 @@ impl Node {
         )
     }
 
-    /// Networks whose own node is the one in Logos: their default way out follows bitcoind.
+    /// Networks whose own node is the one in Logos: their default way out follows bitcoind. Saved
+    /// or not: the Node popup shows the recommendation before the network is saved.
     pub fn local_sends_watch(&self) -> Vec<BNetwork> {
         let inner = self.lock();
-        inner.store.networks.iter().filter(|(n, c)| inner.in_play(**n, c) && Inner::own_kind(c) == Some(Kind::Local)).map(|(n, _)| *n).collect()
+        inner.store.networks.iter().filter(|(_, c)| Inner::own_kind(c) == Some(Kind::Local)).map(|(n, _)| *n).collect()
     }
 
     /// Whether bitcoind sends `net`'s payments privately; `None` when it could not be asked.

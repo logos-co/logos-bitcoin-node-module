@@ -1014,6 +1014,19 @@ fn payments_with_your_node_follow_the_pick_else_the_node() {
 }
 
 #[test]
+fn bitcoind_is_asked_for_every_network_using_the_node_in_logos_saved_or_not() {
+    let h = harness();
+    let local = |on: bool| json!([{"id": "kyoto", "kind": "kyoto"}, {"id": "local", "kind": "local", "use": on}]).to_string();
+    v(h.node.set_sources("mainnet", &local(true)));
+    v(h.node.set_sources("signet", &local(false)));
+    v(h.node.set_sources("testnet4", &json!([{"id": "kyoto", "kind": "kyoto"}, {"id": "mine", "kind": "rpc", "url": "http://192.168.1.9:8332"}]).to_string()));
+    assert_eq!(v(h.node.get_sources("mainnet"))["torUseChosen"], false, "never saved");
+    assert_eq!(h.node.local_sends_watch(), [BNetwork::Mainnet], "only the network whose own node is on and in Logos");
+    v(h.node.set_tor_use("mainnet", "identifying"));
+    assert_eq!(h.node.local_sends_watch(), [BNetwork::Mainnet]);
+}
+
+#[test]
 fn bitcoind_sends_privately_by_its_status_else_its_settings() {
     let n = BNetwork::Signet;
     let running = |mode: &str| json!({"state": "running", "network": "signet", "privateSends": mode});
