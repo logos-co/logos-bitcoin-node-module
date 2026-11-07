@@ -747,6 +747,29 @@ fn the_built_in_tor_is_the_default_and_routes_follow_its_socks_port() {
 }
 
 #[test]
+fn tor_shows_only_for_a_network_in_play() {
+    let h = harness();
+    h.node.init_defaults();
+    // Nothing saved and no wallet open: tor_module is not asked, so health must not say "connecting".
+    assert!(!h.node.uses_built_in_tor());
+    assert_eq!(v(h.node.source_health("mainnet"))["tor"], Value::Null);
+    h.take();
+
+    // A wallet opens: Tor is asked, and health says so at once.
+    h.node.set_wallet_open("mainnet", true);
+    assert!(h.node.uses_built_in_tor());
+    assert_eq!(v(h.node.source_health("mainnet"))["tor"]["state"], "connecting");
+    assert!(h.take().iter().any(|e| e.starts_with("health mainnet")), "the open wallet's health changed");
+
+    // It closes after Tor answered: the last answer is no longer shown, since nothing asks again.
+    h.node.set_tor(tor_view("ready", Some("socks5h://127.0.0.1:9250")));
+    h.node.set_wallet_open("mainnet", false);
+    assert!(!h.node.uses_built_in_tor());
+    assert_eq!(v(h.node.source_health("mainnet"))["tor"], Value::Null);
+    assert!(h.take().iter().any(|e| e.starts_with("health mainnet")));
+}
+
+#[test]
 fn tor_modules_status_reply() {
     let ok = |s: &str| TorView::from_reply(Ok(s.into()));
     let ready = ok(r#"{"ok":true,"state":"ready","progress":100,"detail":"x","socks":"socks5h://127.0.0.1:9250"}"#);
