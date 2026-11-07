@@ -299,9 +299,10 @@ impl Inner {
         }
     }
 
-    /// The built-in Tor for health, while the proxy is it and this network's sources use Tor.
+    /// The built-in Tor for health, while the proxy is it and this network, in play, uses Tor.
+    /// Out of play nothing asks tor_module, so Tor may stay idle: showing it would say "connecting".
     fn tor_value(&self, net: BNetwork, cfg: &NetConfig) -> Value {
-        if self.store.proxy() != Some(BUILT_IN) || !self.uses_tor(net, cfg) {
+        if self.store.proxy() != Some(BUILT_IN) || !self.in_play(net, cfg) || !self.uses_tor(net, cfg) {
             return Value::Null;
         }
         match &self.tor {
@@ -1100,12 +1101,16 @@ impl Node {
             Ok(n) => n,
             Err(e) => return reply::err(e),
         };
-        let mut inner = self.lock();
-        if open {
-            inner.wallet_open.insert(net);
-        } else {
-            inner.wallet_open.remove(&net);
-        }
+        let events = {
+            let mut inner = self.lock();
+            if open {
+                inner.wallet_open.insert(net);
+            } else {
+                inner.wallet_open.remove(&net);
+            }
+            inner.changes(net)
+        };
+        self.emit(events);
         reply::ok(json!({"network": net.name(), "walletOpen": open}))
     }
 
