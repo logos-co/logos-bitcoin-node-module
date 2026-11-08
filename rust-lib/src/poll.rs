@@ -279,6 +279,9 @@ mod tests {
         let sink: Sink = Arc::new(|_| {});
         let node = Node::open(Some(dir.path().join(crate::store::FILE_NAME)), sink);
         assert!(node.init_defaults().starts_with(r#"{"ok":true"#));
+        for net in ["mainnet", "testnet4"] {
+            assert!(node.set_tor_use(net, "identifying").starts_with(r#"{"ok":true"#));
+        }
         assert!(node.set_proxy(&format!("socks5h://127.0.0.1:{port}")).starts_with(r#"{"ok":true"#));
         let poller = Poller::start(node.clone()).unwrap();
         let mut held = Vec::new();
