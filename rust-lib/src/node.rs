@@ -19,8 +19,8 @@ use crate::network::{bad_network, networks, BNetwork};
 use crate::peers::{self, peer_host};
 use crate::proxy::{self, BUILT_IN, DEFAULT_PROXY};
 use crate::reply;
-use crate::sources::{self, Changes, Credentials, Kind, Source, LOCAL_ID};
-use crate::store::{NetConfig, Store, Suspicion, TorUse};
+use crate::sources::{self, Changes, Credentials, Kind, RouteEntry, Source, LOCAL_ID};
+use crate::store::{LocalSends, NetConfig, Store, Suspicion, TorUse};
 
 pub const NO_PROXY: &str = "no proxy is set";
 pub const TOR_STARTING: &str = "the Tor that comes with Logos is starting";
@@ -114,6 +114,17 @@ impl TorView {
     }
 }
 
+/// Whether bitcoind sends `net`'s payments privately: what its status says while it runs that
+/// network, else its settings (`privateSends`, or a `proxy`). `None` without settings.
+pub fn sends_privately(net: BNetwork, config: Option<&Value>, status: Option<&Value>) -> Option<bool> {
+    let on_net = |st: &Value| st["state"] == "running" && st["network"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(net.name()) || (net == BNetwork::Mainnet && n == "main"));
+    if let Some(mode) = status.filter(|st| on_net(st)).and_then(|st| st["privateSends"].as_str()) {
+        return Some(matches!(mode, "on" | "proxy"));
+    }
+    let c = config.filter(|c| c.is_object())?;
+    Some(c["proxy"].as_str().is_some_and(|p| !p.trim().is_empty()) || c["privateSends"] == true)
+}
+
 /// bitcoind_module's status, when it is loaded. A trait so the pure tests can stand one in.
 pub trait LocalStatus: Send + Sync {
     fn status(&self) -> Result<Value, String>;
@@ -138,6 +149,8 @@ struct Inner {
     wallet_open: BTreeSet<BNetwork>,
     /// Kyoto's peer books per network, onion and clearnet (none on regtest), beside the sources file.
     books: BTreeMap<BNetwork, Book>,
+    /// Whether bitcoind sends each network's payments privately, as last read.
+    local_private: BTreeMap<BNetwork, bool>,
     clear_books: BTreeMap<BNetwork, Book>,
     dir: Option<PathBuf>,
     /// Regtest's fixed seeds: a test-only setting from regtest.json.
@@ -228,9 +241,48 @@ impl Inner {
         cfg.sources.iter().any(|s| s.enabled && s.kind == Kind::Rpc && matches!(self.route_of(cfg, s), Route::Tor | Route::Onion))
     }
 
-    /// Whether `cfg`'s sources in use go through Tor: your node's own switch, else Use Tor for.
-    fn uses_tor(&self, cfg: &NetConfig) -> bool {
-        if sources::own_node_on(&cfg.sources) { self.own_node_tor(cfg) } else { cfg.tor_use.tor() }
+    /// Whether `cfg`'s sources in use go through Tor: your node's own switch or its sends, else Use Tor for.
+    fn uses_tor(&self, net: BNetwork, cfg: &NetConfig) -> bool {
+        if sources::own_node_on(&cfg.sources) { self.own_node_tor(cfg) || self.sends_tor(net, cfg) } else { cfg.tor_use.tor() }
+    }
+
+    /// Your node on `cfg`: `Local` in Logos or `Rpc` at an address.
+    fn own_kind(cfg: &NetConfig) -> Option<Kind> {
+        cfg.sources.iter().find(|s| s.enabled && sources::own_node(s)).map(|s| s.kind)
+    }
+
+    /// With your node on, the private way out: the node in Logos when bitcoind sends privately,
+    /// else public servers over Tor (a node at an address can't be asked).
+    fn sends_recommended(&self, net: BNetwork, cfg: &NetConfig) -> Option<LocalSends> {
+        match Self::own_kind(cfg)? {
+            Kind::Local if self.local_private.get(&net) == Some(&true) => Some(LocalSends::Node),
+            _ => Some(LocalSends::Servers),
+        }
+    }
+
+    /// Where payments go with your node on: the person's pick, else the recommended way.
+    fn sends(&self, net: BNetwork, cfg: &NetConfig) -> Option<LocalSends> {
+        self.sends_recommended(net, cfg).map(|r| cfg.local_sends.unwrap_or(r))
+    }
+
+    /// The servers sends go through; empty unless public servers are picked and there is one.
+    fn public_senders(&self, net: BNetwork, cfg: &NetConfig) -> Vec<RouteEntry> {
+        if self.sends(net, cfg) != Some(LocalSends::Servers) {
+            return vec![];
+        }
+        let usable = |s: &Source| !cfg.suspects.contains_key(&s.id) && !self.health_of(net, s).is_some_and(|h| h.state == State::WrongNetwork);
+        sources::public_senders(net, &cfg.sources, usable)
+    }
+
+    fn sends_tor(&self, net: BNetwork, cfg: &NetConfig) -> bool {
+        self.public_senders(net, cfg).iter().any(|e| matches!(e.route, Route::Tor | Route::Onion))
+    }
+
+    /// The sends fields of get_sources and source_health.
+    fn sends_value(&self, net: BNetwork, cfg: &NetConfig) -> Value {
+        let senders: Vec<Value> = self.public_senders(net, cfg).iter().map(|e| json!({"id": e.id, "operator": e.operator, "route": e.route})).collect();
+        json!({"localSends": self.sends(net, cfg), "localSendsChosen": cfg.local_sends.is_some(),
+               "localSendsRecommended": self.sends_recommended(net, cfg), "sendServers": senders})
     }
 
     /// Why Tor routes have nowhere to dial.
@@ -250,7 +302,7 @@ impl Inner {
     /// The built-in Tor for health, while the proxy is it and this network, in play, uses Tor.
     /// Out of play nothing asks tor_module, so Tor may stay idle: showing it would say "connecting".
     fn tor_value(&self, net: BNetwork, cfg: &NetConfig) -> Value {
-        if self.store.proxy() != Some(BUILT_IN) || !self.in_play(net, cfg) || !self.uses_tor(cfg) {
+        if self.store.proxy() != Some(BUILT_IN) || !self.in_play(net, cfg) || !self.uses_tor(net, cfg) {
             return Value::Null;
         }
         match &self.tor {
@@ -385,7 +437,14 @@ impl Inner {
 
     fn route_table(&self, net: BNetwork) -> String {
         let Some(cfg) = self.cfg(net) else { return reply::err(not_configured(net)) };
-        let r = self.roles(net, cfg);
+        let mut r = self.roles(net, cfg);
+        let senders = self.public_senders(net, cfg);
+        let own = sources::own_node_on(&cfg.sources);
+        // Your node stays last for an older core, which sends only through it; a newer one reads
+        // `localSends` and leaves it out.
+        if !senders.is_empty() {
+            r.broadcast = senders.into_iter().chain(r.broadcast).collect();
+        }
         let routed = r.history.iter().any(|e| e.kind == Kind::Kyoto);
         let peers = if routed { self.usable(net, cfg) } else { vec![] };
         let split = if routed { self.kyoto_split(net, cfg) } else { None };
@@ -395,8 +454,9 @@ impl Inner {
             .filter(|s| s.enabled)
             .filter_map(|s| self.unrouted(net, cfg, s).map(|why| json!({"id": s.id, "reason": why})))
             .collect();
-        // Your node alone dials only its own Tor, if any.
-        let proxy = if sources::own_node_on(&cfg.sources) { self.tor_proxy().filter(|_| self.own_node_tor(cfg)) } else { self.dial_proxy(cfg) };
+        // Your node dials only its own Tor, if any; sends through public servers dial Tor too.
+        let proxy = if own { self.tor_proxy().filter(|_| self.own_node_tor(cfg) || self.sends_tor(net, cfg)) } else { self.dial_proxy(cfg) };
+        let sends = own.then(|| if r.broadcast.iter().any(|e| e.kind == Kind::Electrum) { LocalSends::Servers } else { LocalSends::Node });
         reply::ok(json!({
             "network": net.name(),
             "proxy": proxy,
@@ -410,6 +470,7 @@ impl Inner {
             "unrouted": unrouted,
             "torUse": cfg.tor_use,
             "kyotoSplit": split,
+            "localSends": sends,
         }))
     }
 
@@ -439,6 +500,7 @@ impl Inner {
             "proxy": self.store.proxy(),
             "torUse": cfg.tor_use,
             "torUseChosen": cfg.tor_use_chosen,
+            "sends": self.sends_value(net, cfg),
             "sources": list,
             "exposes": sources::exposes(&cfg.sources, lan),
             "withoutTor": sources::without_tor(&cfg.sources, route, lan),
@@ -517,6 +579,7 @@ impl Inner {
             "tor": self.tor_value(net, cfg),
             "torUse": cfg.tor_use,
             "torUseChosen": cfg.tor_use_chosen,
+            "sends": self.sends_value(net, cfg),
         })
     }
 
@@ -596,6 +659,7 @@ impl Node {
             dir,
             regtest_seeds: vec![],
             tor: None,
+            local_private: BTreeMap::new(),
         };
         for net in networks() {
             inner.load_book(net);
@@ -749,7 +813,7 @@ impl Node {
     pub fn uses_built_in_tor(&self) -> bool {
         let inner = self.lock();
         inner.store.proxy() == Some(BUILT_IN)
-            && inner.store.networks.iter().any(|(n, c)| inner.in_play(*n, c) && (c.tor_use.tor() || inner.own_node_tor(c)))
+            && inner.store.networks.iter().any(|(n, c)| inner.in_play(*n, c) && (c.tor_use.tor() || inner.own_node_tor(c) || inner.sends_tor(*n, c)))
     }
 
     /// tor_module's latest status. Routes follow its SOCKS port and health shows it. The poller
@@ -980,6 +1044,55 @@ impl Node {
                 reply::ok(json!({"network": net.name(), "torUse": cfg.tor_use, "torUseChosen": cfg.tor_use_chosen}))
             },
         )
+    }
+
+    /// With your own node on, where `network`'s payments go: `servers` (public servers over Tor)
+    /// or `node`. Until set, the node decides (`sends`). Refused while any wallet is open.
+    pub fn set_local_sends(&self, network: &str, via: &str) -> String {
+        let net = match parse_net(network) {
+            Ok(n) => n,
+            Err(e) => return reply::err(e),
+        };
+        let Some(via) = LocalSends::parse(via) else { return reply::err(format!("{}sends go through servers or node", reply::INVALID)) };
+        self.mutate(
+            true,
+            |store, open| {
+                if !open.is_empty() {
+                    return Err(LOCKED.into());
+                }
+                store.networks.get_mut(&net).ok_or_else(|| not_configured(net))?.local_sends = Some(via);
+                Ok(((), vec![]))
+            },
+            |inner, ()| {
+                let cfg = inner.cfg(net).expect("set above");
+                let mut v = inner.sends_value(net, cfg);
+                v["network"] = json!(net.name());
+                reply::ok(v)
+            },
+        )
+    }
+
+    /// Networks whose own node is the one in Logos: their default way out follows bitcoind. Saved
+    /// or not: the Node popup shows the recommendation before the network is saved.
+    pub fn local_sends_watch(&self) -> Vec<BNetwork> {
+        let inner = self.lock();
+        inner.store.networks.iter().filter(|(_, c)| Inner::own_kind(c) == Some(Kind::Local)).map(|(n, _)| *n).collect()
+    }
+
+    /// Whether bitcoind sends `net`'s payments privately; `None` when it could not be asked.
+    pub fn set_local_private(&self, net: BNetwork, private: Option<bool>) {
+        let events = {
+            let mut inner = self.lock();
+            if inner.local_private.get(&net).copied() == private {
+                return;
+            }
+            match private {
+                Some(p) => inner.local_private.insert(net, p),
+                None => inner.local_private.remove(&net),
+            };
+            inner.changes(net)
+        };
+        self.emit(events);
     }
 
     /// The backend says whether a wallet is open on `network`. Kept in memory only.

@@ -1,0 +1,68 @@
+name: bitcoin_node_module — the way payments go follows bitcoind, through the real modules
+project_name: logos-bitcoin-node-module
+
+# Builds this repo at {release} (CI pins it to the commit under test with --release-for), and
+# logosctl, bitcoind_module and tor_module from GitHub. The steps share one working directory.
+# No node is started: bitcoind_module only answers getConfig and status. POSIX sh.
+#
+# Works against bitcoind_module with or without `privateSends`: a `proxy` makes either one send
+# privately, and the last check reads what bitcoind itself says. callers.json in this module's
+# instance directory admits the shell (`allowHost`), as the README's Callers section says.
+
+intro: |
+  With your own node in Logos, payments go through it by default only when bitcoind sends them
+  privately. The node module asks bitcoind_module every 15 s, for every network whose own node
+  is the one in Logos, whether its Node settings were saved yet or not.
+
+sections:
+  - title: "Build the modules and the runtime"
+    steps:
+      - title: "Build and stage bitcoin_node_module, bitcoind_module and tor_module"
+        run: |
+          set -eu
+          nix build 'github:logos-co/logos-logoscore-cli#ctl-bundle-dir' --no-write-lock-file --out-link ./logos
+          nix build 'github:logos-co/logos-bitcoin-node-module{release}#install-portable' --no-write-lock-file -o result-node
+          nix build 'github:logos-co/logos-bitcoind-module#install-portable' --no-write-lock-file -o result-bitcoind
+          nix build 'github:logos-co/logos-tor-module#install-portable' --no-write-lock-file -o result-tor
+          mkdir -p tree/modules
+          cp -rL result-node/modules/* result-bitcoind/modules/* result-tor/modules/* tree/modules/
+          chmod -R u+w tree
+          ls tree/modules
+        expect_contains: ["bitcoin_node_module", "bitcoind_module", "tor_module"]
+
+  - title: "Follow bitcoind"
+    steps:
+      - title: "Your node in Logos on an unsaved network: the default follows bitcoind's settings"
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          rm -rf "$LOGOSCTL_CONFIG_DIR" home; mkdir -p "$LOGOSCTL_CONFIG_DIR" home
+          ctl() { ./logos/bin/logosctl "$@"; }
+          sends() { ctl call bitcoin_node_module get_sources mainnet | python3 -c 'import json,sys; v=json.loads(json.load(sys.stdin)["result"]); print(v["torUseChosen"], (v.get("sends") or {}).get("localSendsRecommended"))'; }
+          # Polls get_sources until the recommendation is $1, for up to 25 s (bitcoind is asked every 15 s).
+          until_rec() {
+            i=0
+            while :; do
+              s=$(sends)
+              case "$s" in *" $1") echo "chosen, recommended: $s"; return 0;; esac
+              i=$((i + 1)); [ $i -lt 50 ] || { echo "timed out waiting for $1: $s"; return 1; }
+              sleep 0.5
+            done
+          }
+          printf 'modules_dirs: [%s]\n' "$PWD/tree/modules" | ctl daemon config set - > /dev/null
+          HOME="$PWD/home" ctl daemon start --detach
+          trap 'ctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ctl module load bitcoind_module > /dev/null
+          ctl module load bitcoin_node_module > /dev/null
+          d=$(ls -d session/data/bitcoin_node_module/*/ | head -1)
+          printf '{"allowHost":true}' > "$d/callers.json"
+          ctl module unload bitcoin_node_module > /dev/null; sleep 1; ctl module load bitcoin_node_module > /dev/null
+          # Your node in Logos, and Node never saved for mainnet (no set_tor_use).
+          ctl call bitcoin_node_module set_sources mainnet 'str:[{"id":"kyoto","kind":"kyoto"},{"id":"local","kind":"local","use":true}]' > /dev/null
+          ctl call bitcoind_module configure mainnet 'json:{"proxy":"127.0.0.1:9050"}' > /dev/null
+          echo "bitcoind with a proxy:"; until_rec node
+          ctl call bitcoind_module configure mainnet 'json:{"proxy":""}' > /dev/null
+          want=$(ctl call bitcoind_module getConfig mainnet | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print("node" if r.get("privateSends") is True else "servers")')
+          echo "bitcoind without a proxy (privateSends: $want):"; until_rec "$want"
+          echo "followed bitcoind both times"
+        expect_contains: ["False node", "followed bitcoind both times"]
